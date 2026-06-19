@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Monday.com settings</title>
+  <style>
+    :root {
+      --ink-950: #0a0b10; --ink-900: #11131b; --ink-800: #1a1d28;
+      --ink-500: #6b7280; --ink-400: #9ca3af; --ink-300: #c3c8d2; --ink-50: #f3f4f6;
+      --luna-600: #6d5efc; --luna-500: #8b7bff; --luna-400: #a99bff;
+      --green: #34d399; --red: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: transparent; }
+    body {
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      color: var(--ink-50); padding: 2rem; max-width: 46rem;
+    }
+    h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .25rem; }
+    .sub { color: var(--ink-400); font-size: .85rem; margin: 0 0 1.5rem; line-height: 1.45; }
+    .card {
+      background: rgba(17,19,27,.4); border: 1px solid rgba(255,255,255,.06);
+      border-radius: .75rem; padding: 1.25rem;
+    }
+    .row { display: flex; align-items: center; gap: .55rem; margin-bottom: .75rem; }
+    .dot { width: .55rem; height: .55rem; border-radius: 50%; }
+    .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
+    .dot.off { background: var(--ink-500); }
+    .meta { color: var(--ink-300); font-size: .85rem; margin-bottom: .35rem; }
+    .meta b { color: var(--ink-50); font-weight: 600; }
+    p.lead { color: var(--ink-300); font-size: .9rem; margin: 0 0 1rem; line-height: 1.45; }
+    button {
+      display: inline-flex; align-items: center; gap: .5rem; cursor: pointer;
+      border: none; border-radius: .5rem; font-size: .875rem; font-weight: 500;
+      padding: .6rem 1rem; color: #fff; transition: background .15s, opacity .15s; margin-top: .5rem;
+    }
+    button.primary { background: var(--luna-600); }
+    button.primary:hover { background: var(--luna-500); }
+    button.danger { background: rgba(220,38,38,.8); }
+    button.danger:hover { background: rgb(220,38,38); }
+    button:disabled { opacity: .5; cursor: default; }
+    .err {
+      margin-bottom: 1rem; font-size: .85rem; color: #fecaca;
+      background: rgba(127,29,29,.3); border: 1px solid rgba(153,27,27,.5);
+      border-radius: .5rem; padding: .65rem .75rem;
+    }
+    .muted { color: var(--ink-400); font-size: .85rem; }
+    .hidden { display: none; }
+    .spinner {
+      width: 1rem; height: 1rem; border: 2px solid rgba(255,255,255,.3);
+      border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite;
+      display: inline-block; vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <h1>Monday.com</h1>
+  <p class="sub">Connect Luna to your Monday.com account to manage boards, items, columns, and comments.</p>
+
+  <div id="error" class="err hidden"></div>
+  <div id="loading" class="card muted"><span class="spinner"></span> <span style="vertical-align:middle">Loading…</span></div>
+
+  <div id="connected" class="card hidden">
+    <div class="row"><span class="dot on"></span><span style="font-weight:500">Connected</span></div>
+    <div id="account" class="meta hidden"></div>
+    <div id="boards" class="meta hidden"></div>
+    <button id="disconnect-btn" class="danger" data-testid="monday-disconnect-btn">Disconnect</button>
+  </div>
+
+  <div id="disconnected" class="card hidden">
+    <p class="lead">Click below to connect your Monday.com account via OAuth. Luna will be able to manage boards, items, columns, and comments.</p>
+    <button id="connect-btn" class="primary" data-testid="monday-connect-btn">Connect Monday.com</button>
+  </div>
+
+  <script>
+    const BASE = '/api/p/plugin-monday';
+    const token = new URLSearchParams(location.search).get('token');
+
+    function authHeaders(extra) {
+      const h = Object.assign({ 'Content-Type': 'application/json' }, extra || {});
+      if (token) h['Authorization'] = 'Bearer ' + token;
+      return h;
+    }
+    async function fetchJSON(url, init) {
+      const resp = await fetch(url, Object.assign({}, init, { headers: authHeaders(init && init.headers) }));
+      if (!resp.ok) { throw new Error((await resp.text()) || resp.statusText); }
+      return resp.json();
+    }
+    const el = (id) => document.getElementById(id);
+    function showError(m) { const e = el('error'); if (m) { e.textContent = m; e.classList.remove('hidden'); } else { e.classList.add('hidden'); } }
+    function show(which) { for (const id of ['loading','connected','disconnected']) el(id).classList.toggle('hidden', id !== which); }
+
+    async function refresh() {
+      try {
+        const s = await fetchJSON(BASE + '/status');
+        showError(null);
+        if (s.connected) {
+          show('connected');
+          if (s.account_name) { el('account').innerHTML = 'Account: <b>' + s.account_name + '</b>'; el('account').classList.remove('hidden'); }
+          else { el('account').classList.add('hidden'); }
+          if (s.board_count !== null && s.board_count !== undefined) {
+            el('boards').textContent = s.board_count + ' board' + (s.board_count !== 1 ? 's' : '');
+            el('boards').classList.remove('hidden');
+          } else { el('boards').classList.add('hidden'); }
+        } else {
+          show('disconnected');
+        }
+      } catch (e) { showError(e.message); show('disconnected'); }
+    }
+    function busy(btn, on, label) { btn.disabled = on; btn.innerHTML = on ? '<span class="spinner"></span>' + label : btn.dataset.label; }
+
+    function connect() {
+      const url = token ? BASE + '/connect?token=' + encodeURIComponent(token) : BASE + '/connect';
+      window.open(url, '_blank', 'width=600,height=700');
+      const interval = setInterval(refresh, 2000);
+      setTimeout(() => clearInterval(interval), 120000);
+    }
+    async function disconnect() {
+      const btn = el('disconnect-btn'); btn.dataset.label = 'Disconnect';
+      busy(btn, true, 'Disconnecting…'); showError(null);
+      try { await fetchJSON(BASE + '/disconnect', { method: 'POST' }); await refresh(); }
+      catch (e) { showError(e.message); }
+      finally { busy(btn, false, ''); }
+    }
+
+    el('connect-btn').addEventListener('click', connect);
+    el('disconnect-btn').addEventListener('click', disconnect);
+    refresh();
+  </script>
+</body>
+</html>

@@ -1,0 +1,127 @@
+name = "plugin-monday"
+version = "0.1.0"
+description = "Monday.com board and item management via GraphQL."
+entry = "plugin_monday"
+sdk_version = "0"
+license = "MIT"
+tags = ["connector", "monday", "project-management", "oauth"]
+readme = """
+# plugin-monday
+
+Manage Monday.com from Luna — boards, groups, items, subitems, status/columns,
+and updates (comments) over the GraphQL API. Connects via **OAuth 2.0**; the
+connect/callback flow and token persistence run from the managed dir
+(008.5/phase07, enabler E3). Settings UI served as a themed iframe.
+
+Requires `LUNA_MONDAY_CLIENT_ID` + `LUNA_MONDAY_CLIENT_SECRET` env vars (your
+Monday app credentials).
+
+Source: https://github.com/huemorgan/plugin-monday
+"""
+
+[requires]
+tools = 17
+depends_on = ["plugin-vault"]
+env = ["LUNA_MONDAY_CLIENT_ID", "LUNA_MONDAY_CLIENT_SECRET"]
+
+[[tools]]
+name = "monday_list_boards"
+description = "List Monday.com boards."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_get_board"
+description = "Get details of a Monday.com board."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_list_groups"
+description = "List groups in a board."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_create_group"
+description = "Create a new group in a board."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_list_items"
+description = "List items on a board."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_get_item"
+description = "Get details of an item."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_create_item"
+description = "Create a new item on a board."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_update_item"
+description = "Update column values on an item."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_delete_item"
+description = "Delete an item."
+policy = "ask"
+risk_level = "high"
+
+[[tools]]
+name = "monday_move_item"
+description = "Move an item to a different group."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_archive_item"
+description = "Archive an item."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_set_status"
+description = "Set a status column value on an item."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_get_column_values"
+description = "Get all column values for an item."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_create_update"
+description = "Post a comment (update) on an item."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_list_updates"
+description = "List comments (updates) on an item."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_create_subitem"
+description = "Create a subitem under an item."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_list_subitems"
+description = "List subitems of an item."
+policy = "auto_approve"
+risk_level = "low"
