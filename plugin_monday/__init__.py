@@ -8,9 +8,11 @@ monday-updates skills to gain access.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from luna_sdk import (
+    CredentialSlot,
     LunaPlugin,
     PluginContext,
     PluginManifest,
@@ -26,12 +28,14 @@ log = logging.getLogger("plugin-monday")
 
 VAULT_TOKEN_KEY = "plugin_monday.oauth"
 VAULT_ACCOUNT_KEY = "plugin_monday.account_id"
+ENV_KEY = "LUNA_MONDAY_API_KEY"
+ENV_BASE_URL = "LUNA_MONDAY_BASE_URL"
 
 
 class MondayPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-monday",
-        version="0.1.0",
+        version="0.2.0",
         description="Monday.com board and item management via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
@@ -48,26 +52,61 @@ class MondayPlugin(LunaPlugin):
         interfaces={"webui": "interface/webui"},
     )
 
+    def credential_slots(self) -> list[CredentialSlot]:
+        # env_base_url_var marks monday proxy-provisionable: the gateway sets
+        # LUNA_MONDAY_BASE_URL (={gateway}/proxy/monday) + the token via
+        # LUNA_MONDAY_API_KEY. Only GraphQL data calls proxy; OAuth stays direct.
+        return [
+            CredentialSlot(
+                slug="monday",
+                credential_name=VAULT_TOKEN_KEY,
+                env_key_var=ENV_KEY,
+                env_base_url_var=ENV_BASE_URL,
+                owner=self.manifest.name,
+            )
+        ]
+
     async def on_load(self, ctx: PluginContext) -> None:
         set_client(None)
-        vault = ctx.vault
-        if vault is None:
-            log.warning("Vault not available; plugin-monday inactive")
-            return
 
-        token: str | None = None
-        try:
-            cred = await vault.get_credential(VAULT_TOKEN_KEY)
-            token = cred.value
-        except KeyError:
-            pass
+        # Token: vault first (OAuth token), then env (the gateway token in proxy
+        # mode). Base-url: env only — when set, route GraphQL through the proxy.
+        token = await self._resolve_token(ctx)
+        base_url = self._resolve_base_url(ctx)
 
         if token:
-            set_client(MondayClient(token))
+            set_client(MondayClient(token, base_url=base_url))
 
         self._register_tools(ctx)
         self._register_skills(ctx)
-        log.info("plugin-monday loaded (tools=17, connected=%s)", get_client() is not None)
+        log.info(
+            "plugin-monday loaded (tools=17, connected=%s, gateway=%s)",
+            get_client() is not None, bool(base_url),
+        )
+
+    async def _resolve_token(self, ctx: PluginContext) -> str | None:
+        vault = getattr(ctx, "vault", None)
+        if vault is not None:
+            try:
+                cred = await vault.get_credential(VAULT_TOKEN_KEY)
+                if (cred.value or "").strip():
+                    return cred.value.strip()
+            except KeyError:
+                pass
+            except Exception as exc:  # noqa: BLE001
+                log.warning("plugin-monday: vault read failed: %s", exc)
+        if getattr(ctx, "get_env", None) is not None:
+            val = (ctx.get_env(ENV_KEY) or "").strip()
+            if val:
+                return val
+        return (os.environ.get("MONDAY_API_KEY") or "").strip() or None
+
+    def _resolve_base_url(self, ctx: PluginContext) -> str | None:
+        if getattr(ctx, "get_env", None) is not None:
+            val = (ctx.get_env(ENV_BASE_URL) or "").strip()
+            if val:
+                return val
+        return (os.environ.get("MONDAY_BASE_URL") or "").strip() or None
 
     async def on_unload(self) -> None:
         client = get_client()

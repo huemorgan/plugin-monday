@@ -16,7 +16,13 @@ class MondayAPIError(Exception):
 
 
 class MondayClient:
-    def __init__(self, token: str) -> None:
+    def __init__(self, token: str, base_url: str | None = None) -> None:
+        # `base_url` overrides the GraphQL upstream — set to
+        # `{gateway}/proxy/monday` for cloud key-provisioning (token is then the
+        # opaque gateway token). Unset → the real Monday API + real token. Only
+        # data calls go through here; the OAuth token exchange stays on the real
+        # auth host (see exchange_code).
+        self._api_url = (base_url or API_URL).rstrip("/")
         self._http = httpx.AsyncClient(
             headers={"Authorization": token, "Content-Type": "application/json"},
             timeout=30.0,
@@ -26,7 +32,7 @@ class MondayClient:
         body: dict[str, Any] = {"query": query}
         if variables:
             body["variables"] = variables
-        resp = await self._http.post(API_URL, json=body)
+        resp = await self._http.post(self._api_url, json=body)
         resp.raise_for_status()
         data = resp.json()
         if "errors" in data and data["errors"]:
