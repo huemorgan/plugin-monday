@@ -35,9 +35,10 @@ ENV_BASE_URL = "LUNA_MONDAY_BASE_URL"
 class MondayPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-monday",
+        shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.2.1",
+        version="0.2.2",
         description="Monday.com board and item management via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
