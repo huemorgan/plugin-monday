@@ -38,7 +38,7 @@ class MondayPlugin(LunaPlugin):
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.2.2",
+        version="0.2.4",
         description="Monday.com board and item management via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],

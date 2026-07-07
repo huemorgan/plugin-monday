@@ -238,13 +238,22 @@ class MondayClient:
         await self._http.aclose()
 
 
-async def exchange_code(client_id: str, client_secret: str, code: str) -> dict[str, Any]:
-    """Exchange an OAuth authorization code for a token."""
+async def exchange_code(
+    client_id: str, client_secret: str, code: str, redirect_uri: str | None = None
+) -> dict[str, Any]:
+    """Exchange an OAuth authorization code for a token.
+
+    monday returns 401 if the authorize request carried a redirect_uri and
+    the token request omits it — callers must pass the same one.
+    """
+    payload: dict[str, Any] = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+    }
+    if redirect_uri:
+        payload["redirect_uri"] = redirect_uri
     async with httpx.AsyncClient(timeout=30.0) as http:
-        resp = await http.post(AUTH_URL, json={
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": code,
-        })
+        resp = await http.post(AUTH_URL, json=payload)
         resp.raise_for_status()
         return resp.json()

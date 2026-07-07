@@ -70,12 +70,19 @@
   </div>
 
   <div id="disconnected" class="card hidden">
-    <p class="lead">Click below to connect your Monday.com account via OAuth. Luna will be able to manage boards, items, columns, and comments.</p>
-    <button id="connect-btn" class="primary" data-testid="monday-connect-btn">Connect Monday.com</button>
+    <p class="lead">Paste a personal API token — in Monday.com click your avatar &rarr; <b>Developers</b> &rarr; <b>My access tokens</b> &rarr; Copy.</p>
+    <input id="token-input" type="password" placeholder="API token" autocomplete="off"
+           data-testid="monday-token-input"
+           style="width:100%;padding:.6rem .75rem;border-radius:.5rem;border:1px solid rgba(255,255,255,.12);background:rgba(10,11,16,.6);color:var(--ink-50);font-size:.875rem" />
+    <button id="token-btn" class="primary" data-testid="monday-token-btn">Connect with token</button>
+    <p class="lead" style="margin:1.25rem 0 .5rem">Or connect via OAuth (needs a Monday.com app configured on this server).</p>
+    <button id="connect-btn" data-testid="monday-connect-btn"
+            style="background:rgba(255,255,255,.08)">Connect with OAuth</button>
   </div>
 
   <script>
-    const BASE = '/api/p/plugin-monday';
+    // Keep any tenant path prefix (e.g. /a/{slug}) this page is served under.
+    const BASE = location.pathname.split('/api/p/plugin-monday')[0] + '/api/p/plugin-monday';
     const token = new URLSearchParams(location.search).get('token');
 
     function authHeaders(extra) {
@@ -117,6 +124,19 @@
       const interval = setInterval(refresh, 2000);
       setTimeout(() => clearInterval(interval), 120000);
     }
+    async function connectToken() {
+      const input = el('token-input');
+      const value = (input.value || '').trim();
+      if (!value) { showError('Paste your monday.com API token first.'); return; }
+      const btn = el('token-btn'); btn.dataset.label = 'Connect with token';
+      busy(btn, true, 'Connecting…'); showError(null);
+      try {
+        await fetchJSON(BASE + '/connect-token', { method: 'POST', body: JSON.stringify({ token: value }) });
+        input.value = '';
+        await refresh();
+      } catch (e) { showError(e.message); }
+      finally { busy(btn, false, ''); }
+    }
     async function disconnect() {
       const btn = el('disconnect-btn'); btn.dataset.label = 'Disconnect';
       busy(btn, true, 'Disconnecting…'); showError(null);
@@ -126,6 +146,8 @@
     }
 
     el('connect-btn').addEventListener('click', connect);
+    el('token-btn').addEventListener('click', connectToken);
+    el('token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') connectToken(); });
     el('disconnect-btn').addEventListener('click', disconnect);
     refresh();
   </script>

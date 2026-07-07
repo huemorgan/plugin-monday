@@ -1,6 +1,6 @@
 name = "plugin-monday"
 shown_name = "Monday.com"
-version = "0.2.2"
+version = "0.2.4"
 description = "Monday.com board and item management via GraphQL."
 entry = "plugin_monday"
 sdk_version = "0"
@@ -10,12 +10,12 @@ readme = """
 # plugin-monday
 
 Manage Monday.com from Luna — boards, groups, items, subitems, status/columns,
-and updates (comments) over the GraphQL API. Connects via **OAuth 2.0**; the
-connect/callback flow and token persistence run from the managed dir
-(008.5/phase07, enabler E3). Settings UI served as a themed iframe.
+and updates (comments) over the GraphQL API. Connects with a **personal API
+token** (monday.com → avatar → Developers → My access tokens) or via
+**OAuth 2.0**. Settings UI served as a themed iframe.
 
-Requires `LUNA_MONDAY_CLIENT_ID` + `LUNA_MONDAY_CLIENT_SECRET` env vars (your
-Monday app credentials).
+OAuth additionally requires `LUNA_MONDAY_CLIENT_ID` + `LUNA_MONDAY_CLIENT_SECRET`
+env vars (your Monday app credentials); the token path needs nothing.
 
 Source: https://github.com/huemorgan/plugin-monday
 """

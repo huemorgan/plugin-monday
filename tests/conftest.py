@@ -48,17 +48,21 @@ def _install_luna_sdk_stub() -> None:
         env_key_var: str | None = None
         env_base_url_var: str | None = None
 
-    @dataclass
     class PluginManifest:
-        name: str
-        version: str
-        description: str = ""
-        category: str = ""
-        depends_on: list = field(default_factory=list)
-        routes_module: str | None = None
-        settings_tabs: list = field(default_factory=list)
-        interfaces: dict = field(default_factory=dict)
-        tools: list = field(default_factory=list)
+        # kwargs-tolerant like the real pydantic model — new cosmetic manifest
+        # fields (shown_name, icon, image, ...) must not break the test stub.
+        def __init__(self, **kw: Any) -> None:
+            for k, v in kw.items():
+                setattr(self, k, v)
+            self.name = kw.get("name", "")
+            self.version = kw.get("version", "")
+            self.description = kw.get("description", "")
+            self.category = kw.get("category", "")
+            self.depends_on = kw.get("depends_on", [])
+            self.routes_module = kw.get("routes_module")
+            self.settings_tabs = kw.get("settings_tabs", [])
+            self.interfaces = kw.get("interfaces", {})
+            self.tools = kw.get("tools", [])
 
     class PluginContext:  # pragma: no cover - structural stand-in
         tool_registry: Any
@@ -75,6 +79,10 @@ def _install_luna_sdk_stub() -> None:
         def credential_slots(self) -> list:
             return []
 
+    async def get_current_user():  # route tests: auth always passes
+        return {"sub": "owner"}
+
+    mod.get_current_user = get_current_user
     mod.ToolDef = ToolDef
     mod.SettingsTab = SettingsTab
     mod.SkillDef = SkillDef

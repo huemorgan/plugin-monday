@@ -21,13 +21,19 @@ def _public_base(request: Request) -> str:
         val = request.headers.get(hdr)
         if val:
             parsed = urlparse(val)
-            return f"{parsed.scheme}://{parsed.netloc}"
+            # Hosted tenants live under a path prefix (/a/{slug}) the plugin
+            # app never sees — recover it from the referer path.
+            prefix = ""
+            if "/api/p/plugin-monday" in parsed.path:
+                prefix = parsed.path.split("/api/p/plugin-monday", 1)[0].rstrip("/")
+            return f"{parsed.scheme}://{parsed.netloc}{prefix}"
     return str(request.base_url).rstrip("/")
 
 log = logging.getLogger("plugin-monday.routes")
 
 VAULT_TOKEN_KEY = "plugin_monday.oauth"
 VAULT_ACCOUNT_KEY = "plugin_monday.account_id"
+VAULT_REDIRECT_KEY = "plugin_monday.oauth_redirect"
 
 MONDAY_AUTHORIZE_URL = "https://auth.monday.com/oauth2/authorize"
 
@@ -47,6 +53,10 @@ class _StatusResp(BaseModel):
     connected: bool
     account_name: str | None = None
     board_count: int | None = None
+
+
+class _TokenReq(BaseModel):
+    token: str
 
 
 def register_routes(app, ctx):
@@ -93,6 +103,9 @@ def register_routes(app, ctx):
 
         base_url = _public_base(request)
         redirect_uri = f"{base_url}/api/p/plugin-monday/callback"
+        # The token exchange must repeat this exact redirect_uri, but on the
+        # callback request the referer points at monday — persist it instead.
+        await _vault().store_credential(VAULT_REDIRECT_KEY, redirect_uri, kind="metadata")
         params = urllib.parse.urlencode({
             "client_id": cid,
             "redirect_uri": redirect_uri,
@@ -110,7 +123,11 @@ def register_routes(app, ctx):
         client_id = _client_id()
         client_secret = _client_secret()
 
-        token_data = await exchange_code(client_id, client_secret, code)
+        try:
+            redirect_uri = (await _vault().get_credential(VAULT_REDIRECT_KEY)).value
+        except KeyError:
+            redirect_uri = f"{_public_base(request)}/api/p/plugin-monday/callback"
+        token_data = await exchange_code(client_id, client_secret, code, redirect_uri)
         token = token_data.get("access_token")
         if not token:
             raise HTTPException(502, "No access_token in Monday response")
@@ -140,6 +157,43 @@ def register_routes(app, ctx):
             "<html><body><script>window.close()</script>"
             "<p>Monday.com connected. You can close this tab.</p></body></html>"
         )
+
+    @router.post("/connect-token")
+    async def connect_token(body: _TokenReq, user=Depends(get_current_user)):
+        """Connect with a personal API token (monday.com → Developers → My
+        access tokens) — no OAuth app or client-id/secret env vars needed."""
+        from .client import MondayClient
+
+        token = body.token.strip()
+        if not token:
+            raise HTTPException(400, "Missing token")
+
+        probe = MondayClient(token)
+        try:
+            account_data = await probe.get_account()
+        except Exception:
+            await probe.close()
+            raise HTTPException(401, "monday.com rejected the token")
+
+        account = account_data.get("me", {}).get("account", {}) or {}
+        account_name = account.get("name", "")
+        account_id = str(account.get("id", "") or "")
+
+        vault = _vault()
+        await vault.store_credential(VAULT_TOKEN_KEY, token, kind="api_key")
+        if account_id:
+            await vault.store_credential(VAULT_ACCOUNT_KEY, account_id, kind="metadata")
+
+        old = get_client()
+        if old is not None:
+            await old.close()
+        set_client(probe)
+
+        await ctx.events.emit("monday.connected", {
+            "account_name": account_name,
+            "account_id": account_id,
+        })
+        return {"connected": True, "account_name": account_name}
 
     @router.post("/disconnect")
     async def disconnect(user=Depends(get_current_user)):
