@@ -1,7 +1,7 @@
 [project]
 name = "plugin-monday"
-version = "0.2.4"
-description = "Monday.com board/item management for Luna. Built on luna_sdk v0."
+version = "0.3.0"
+description = "Monday.com boards, items, webhooks, and full API access for Luna. Built on luna_sdk v0."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"

@@ -1,14 +1,49 @@
-"""Async HTTP client for the Monday.com GraphQL API (v2)."""
+"""Async client for the Monday.com GraphQL API.
+
+Two transports, one GraphQL surface:
+
+- **oauth** — the no-app OAuth path. Tokens come from monday's Dynamic Client
+  Registration flow (RFC 7591) on ``mcp.monday.com``; no monday app has to be
+  created or installed. Those tokens are rejected by ``api.monday.com/v2``
+  (verified empirically: 401), so GraphQL is executed through the
+  ``all_api_read`` / ``all_api_write`` passthrough tools on monday's MCP server
+  via plain JSON-RPC over HTTP — no MCP SDK, no session state. Access tokens
+  live 7 days and are auto-refreshed with the refresh token.
+
+- **direct** — a personal API token (or a gateway-provisioned token via
+  ``base_url``) posted straight to ``api.monday.com/v2``.
+"""
 
 from __future__ import annotations
 
 import json
-from typing import Any
+import re
+import time
+from typing import Any, Awaitable, Callable
 
 import httpx
 
 API_URL = "https://api.monday.com/v2"
-AUTH_URL = "https://auth.monday.com/oauth2/token"
+
+MCP_BASE = "https://mcp.monday.com"
+MCP_RPC_URL = f"{MCP_BASE}/mcp"
+MCP_REGISTER_URL = f"{MCP_BASE}/register"
+MCP_AUTHORIZE_URL = f"{MCP_BASE}/authorize"
+MCP_TOKEN_URL = f"{MCP_BASE}/token"
+
+_MUTATION_RE = re.compile(r"^\s*mutation\b")
+
+# Board events monday accepts in the create_webhook mutation.
+WEBHOOK_EVENTS = [
+    "create_item", "change_name", "change_column_value",
+    "change_status_column_value", "change_specific_column_value",
+    "item_moved_to_any_group", "item_moved_to_specific_group",
+    "item_archived", "item_deleted", "item_restored",
+    "create_subitem", "change_subitem_name", "change_subitem_column_value",
+    "move_subitem", "subitem_archived", "subitem_deleted",
+    "create_update", "edit_update", "delete_update", "create_subitem_update",
+    "when_date_arrived",
+]
 
 
 class MondayAPIError(Exception):
@@ -16,28 +51,116 @@ class MondayAPIError(Exception):
 
 
 class MondayClient:
-    def __init__(self, token: str, base_url: str | None = None) -> None:
-        # `base_url` overrides the GraphQL upstream — set to
-        # `{gateway}/proxy/monday` for cloud key-provisioning (token is then the
-        # opaque gateway token). Unset → the real Monday API + real token. Only
-        # data calls go through here; the OAuth token exchange stays on the real
-        # auth host (see exchange_code).
+    def __init__(
+        self,
+        token: str,
+        base_url: str | None = None,
+        *,
+        oauth: dict[str, Any] | None = None,
+        on_refresh: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
+        # `oauth` switches to the MCP passthrough transport. It carries
+        # client_id + refresh_token + expires_at (epoch seconds). `on_refresh`
+        # is awaited with the updated bundle after every token refresh so the
+        # caller can persist it. Without `oauth`, `token` is a personal API
+        # token (or gateway token when `base_url` points at the proxy) and
+        # GraphQL goes straight to api.monday.com/v2.
+        self._token = token
+        self._oauth = dict(oauth) if oauth else None
+        self._on_refresh = on_refresh
         self._api_url = (base_url or API_URL).rstrip("/")
-        self._http = httpx.AsyncClient(
-            headers={"Authorization": token, "Content-Type": "application/json"},
-            timeout=30.0,
-        )
+        self._http = httpx.AsyncClient(timeout=30.0)
+
+    @property
+    def transport(self) -> str:
+        return "oauth" if self._oauth else "direct"
 
     async def _gql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        if self._oauth is not None:
+            return await self._gql_mcp(query, variables)
+        return await self._gql_direct(query, variables)
+
+    async def _gql_direct(self, query: str, variables: dict[str, Any] | None) -> dict[str, Any]:
         body: dict[str, Any] = {"query": query}
         if variables:
             body["variables"] = variables
-        resp = await self._http.post(self._api_url, json=body)
+        resp = await self._http.post(
+            self._api_url, json=body,
+            headers={"Authorization": self._token, "Content-Type": "application/json"},
+        )
         resp.raise_for_status()
         data = resp.json()
         if "errors" in data and data["errors"]:
             raise MondayAPIError(data["errors"][0].get("message", str(data["errors"])))
         return data.get("data", {})
+
+    async def _gql_mcp(self, query: str, variables: dict[str, Any] | None) -> dict[str, Any]:
+        if self._token_stale():
+            await self._refresh()
+        resp = await self._post_mcp(query, variables)
+        if resp.status_code == 401:
+            await self._refresh()
+            resp = await self._post_mcp(query, variables)
+        resp.raise_for_status()
+        data = resp.json()
+        if "error" in data:
+            raise MondayAPIError(data["error"].get("message", str(data["error"])))
+        result = data.get("result", {})
+        if result.get("isError"):
+            texts = [c.get("text", "") for c in result.get("content", []) if c.get("type") == "text"]
+            raise MondayAPIError(" ".join(texts) or "monday MCP tool call failed")
+        sc = result.get("structuredContent")
+        if isinstance(sc, dict):
+            return sc
+        for c in result.get("content", []):
+            if c.get("type") == "text":
+                return json.loads(c["text"])
+        return {}
+
+    async def _post_mcp(self, query: str, variables: dict[str, Any] | None) -> httpx.Response:
+        tool = "all_api_write" if _MUTATION_RE.match(query) else "all_api_read"
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                # The passthrough tools require `variables` as a JSON *string*.
+                "arguments": {"query": query, "variables": json.dumps(variables or {})},
+            },
+        }
+        return await self._http.post(
+            MCP_RPC_URL, json=payload,
+            headers={
+                "Authorization": f"Bearer {self._token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
+            },
+        )
+
+    def _token_stale(self) -> bool:
+        exp = (self._oauth or {}).get("expires_at")
+        return bool(exp) and time.time() > float(exp) - 120
+
+    async def _refresh(self) -> None:
+        assert self._oauth is not None
+        tok = await dcr_refresh(self._oauth["client_id"], self._oauth["refresh_token"])
+        self._token = tok["access_token"]
+        self._oauth["refresh_token"] = tok.get("refresh_token", self._oauth["refresh_token"])
+        self._oauth["expires_at"] = time.time() + float(tok.get("expires_in", 3600))
+        if self._on_refresh is not None:
+            await self._on_refresh({
+                "access_token": self._token,
+                "refresh_token": self._oauth["refresh_token"],
+                "expires_at": self._oauth["expires_at"],
+                "client_id": self._oauth["client_id"],
+            })
+
+    # ── raw API ────────────────────────────────────────────────
+
+    async def api(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Execute arbitrary GraphQL against the Monday.com API."""
+        return await self._gql(query, variables)
 
     # ── boards ─────────────────────────────────────────────────
 
@@ -60,6 +183,72 @@ class MondayClient:
             raise MondayAPIError(f"Board {board_id} not found")
         return boards[0]
 
+    async def create_board(
+        self,
+        board_name: str,
+        *,
+        board_kind: str = "public",
+        workspace_id: int | None = None,
+        description: str | None = None,
+    ) -> dict[str, Any]:
+        parts = ["$name:String!", "$kind:BoardKind!"]
+        args = "board_name:$name, board_kind:$kind"
+        variables: dict[str, Any] = {"name": board_name, "kind": board_kind}
+        if workspace_id:
+            parts.append("$ws:ID")
+            args += ", workspace_id:$ws"
+            variables["ws"] = workspace_id
+        if description:
+            parts.append("$desc:String")
+            args += ", description:$desc"
+            variables["desc"] = description
+        q = f"mutation({', '.join(parts)}){{create_board({args}){{id name}}}}"
+        data = await self._gql(q, variables)
+        return data.get("create_board", {})
+
+    async def archive_board(self, board_id: int) -> dict[str, Any]:
+        q = "mutation($id:ID!){archive_board(board_id:$id){id state}}"
+        data = await self._gql(q, {"id": board_id})
+        return data.get("archive_board", {})
+
+    # ── columns ────────────────────────────────────────────────
+
+    async def create_column(
+        self,
+        board_id: int,
+        title: str,
+        column_type: str,
+        *,
+        defaults: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        parts = ["$board:ID!", "$title:String!", "$type:ColumnType!"]
+        args = "board_id:$board, title:$title, column_type:$type"
+        variables: dict[str, Any] = {"board": board_id, "title": title, "type": column_type}
+        if defaults:
+            parts.append("$defaults:JSON")
+            args += ", defaults:$defaults"
+            variables["defaults"] = json.dumps(defaults)
+        q = f"mutation({', '.join(parts)}){{create_column({args}){{id title type}}}}"
+        data = await self._gql(q, variables)
+        return data.get("create_column", {})
+
+    async def delete_column(self, board_id: int, column_id: str) -> dict[str, Any]:
+        q = "mutation($board:ID!, $col:String!){delete_column(board_id:$board, column_id:$col){id}}"
+        data = await self._gql(q, {"board": board_id, "col": column_id})
+        return data.get("delete_column", {})
+
+    # ── workspaces / users ─────────────────────────────────────
+
+    async def list_workspaces(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        q = "query($limit:Int!){workspaces(limit:$limit){id name kind description}}"
+        data = await self._gql(q, {"limit": limit})
+        return data.get("workspaces", [])
+
+    async def list_users(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        q = "query($limit:Int!){users(limit:$limit){id name email title is_guest}}"
+        data = await self._gql(q, {"limit": limit})
+        return data.get("users", [])
+
     # ── items ──────────────────────────────────────────────────
 
     async def list_items(
@@ -74,13 +263,13 @@ class MondayClient:
             q = (
                 "query($board:ID!, $limit:Int!, $col:String!, $val:CompareValue!)"
                 "{items_page_by_column_values(board_id:$board, limit:$limit, columns:[{column_id:$col, column_values:[$val]}])"
-                "{items{id name state column_values{id title value text}}}}"
+                "{items{id name state column_values{id text value}}}}"
             )
             data = await self._gql(q, {"board": board_id, "limit": limit, "col": column_id, "val": value})
             return data.get("items_page_by_column_values", {}).get("items", [])
         q = (
             "query($ids:[ID!]!, $limit:Int!)"
-            "{boards(ids:$ids){items_page(limit:$limit){items{id name state column_values{id title value text}}}}}"
+            "{boards(ids:$ids){items_page(limit:$limit){items{id name state column_values{id text value}}}}}"
         )
         data = await self._gql(q, {"ids": [board_id], "limit": limit})
         boards = data.get("boards", [])
@@ -89,7 +278,7 @@ class MondayClient:
         return boards[0].get("items_page", {}).get("items", [])
 
     async def get_item(self, item_id: int) -> dict[str, Any]:
-        q = "query($ids:[ID!]!){items(ids:$ids){id name state board{id name} group{id title} column_values{id title value text} subitems{id name}}}"
+        q = "query($ids:[ID!]!){items(ids:$ids){id name state board{id name} group{id title} column_values{id text value} subitems{id name}}}"
         data = await self._gql(q, {"ids": [item_id]})
         items = data.get("items", [])
         if not items:
@@ -160,7 +349,7 @@ class MondayClient:
         return data.get("change_column_value", {})
 
     async def get_column_values(self, item_id: int) -> list[dict[str, Any]]:
-        q = "query($ids:[ID!]!){items(ids:$ids){column_values{id title value text type}}}"
+        q = "query($ids:[ID!]!){items(ids:$ids){column_values{id text value type}}}"
         data = await self._gql(q, {"ids": [item_id]})
         items = data.get("items", [])
         if not items:
@@ -204,7 +393,7 @@ class MondayClient:
         return data.get("create_subitem", {})
 
     async def list_subitems(self, parent_item_id: int) -> list[dict[str, Any]]:
-        q = "query($ids:[ID!]!){items(ids:$ids){subitems{id name state column_values{id title value text}}}}"
+        q = "query($ids:[ID!]!){items(ids:$ids){subitems{id name state column_values{id text value}}}}"
         data = await self._gql(q, {"ids": [parent_item_id]})
         items = data.get("items", [])
         if not items:
@@ -226,6 +415,37 @@ class MondayClient:
         data = await self._gql(q, {"board": board_id, "name": group_name})
         return data.get("create_group", {})
 
+    # ── webhooks ───────────────────────────────────────────────
+
+    async def create_webhook(
+        self,
+        board_id: int,
+        url: str,
+        event: str,
+        *,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        parts = ["$board:ID!", "$url:String!", "$event:WebhookEventType!"]
+        args = "board_id:$board, url:$url, event:$event"
+        variables: dict[str, Any] = {"board": board_id, "url": url, "event": event}
+        if config:
+            parts.append("$config:JSON")
+            args += ", config:$config"
+            variables["config"] = json.dumps(config)
+        q = f"mutation({', '.join(parts)}){{create_webhook({args}){{id board_id event config}}}}"
+        data = await self._gql(q, variables)
+        return data.get("create_webhook", {})
+
+    async def list_webhooks(self, board_id: int) -> list[dict[str, Any]]:
+        q = "query($board:ID!){webhooks(board_id:$board){id event board_id config}}"
+        data = await self._gql(q, {"board": board_id})
+        return data.get("webhooks", []) or []
+
+    async def delete_webhook(self, webhook_id: int) -> dict[str, Any]:
+        q = "mutation($id:ID!){delete_webhook(id:$id){id board_id}}"
+        data = await self._gql(q, {"id": webhook_id})
+        return data.get("delete_webhook", {})
+
     # ── account info ───────────────────────────────────────────
 
     async def get_account(self) -> dict[str, Any]:
@@ -238,22 +458,62 @@ class MondayClient:
         await self._http.aclose()
 
 
-async def exchange_code(
-    client_id: str, client_secret: str, code: str, redirect_uri: str | None = None
-) -> dict[str, Any]:
-    """Exchange an OAuth authorization code for a token.
+def client_from_bundle(
+    bundle: dict[str, Any],
+    on_refresh: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+) -> MondayClient:
+    """Build an OAuth-transport client from a persisted token bundle."""
+    return MondayClient(
+        bundle["access_token"],
+        oauth={
+            "client_id": bundle["client_id"],
+            "refresh_token": bundle["refresh_token"],
+            "expires_at": bundle.get("expires_at"),
+        },
+        on_refresh=on_refresh,
+    )
 
-    monday returns 401 if the authorize request carried a redirect_uri and
-    the token request omits it — callers must pass the same one.
-    """
-    payload: dict[str, Any] = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "code": code,
-    }
-    if redirect_uri:
-        payload["redirect_uri"] = redirect_uri
+
+# ── OAuth Dynamic Client Registration (no monday app needed) ───
+
+
+async def dcr_register(redirect_uri: str, client_name: str = "Luna") -> dict[str, Any]:
+    """Self-register a public OAuth client with monday (RFC 7591)."""
     async with httpx.AsyncClient(timeout=30.0) as http:
-        resp = await http.post(AUTH_URL, json=payload)
+        resp = await http.post(MCP_REGISTER_URL, json={
+            "client_name": client_name,
+            "redirect_uris": [redirect_uri],
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "token_endpoint_auth_method": "none",
+        })
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def dcr_exchange_code(
+    client_id: str, code: str, redirect_uri: str, code_verifier: str,
+) -> dict[str, Any]:
+    """Exchange an authorization code for tokens (PKCE, no client secret)."""
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        resp = await http.post(MCP_TOKEN_URL, data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "client_id": client_id,
+            "code_verifier": code_verifier,
+        })
+        resp.raise_for_status()
+        return resp.json()
+
+
+async def dcr_refresh(client_id: str, refresh_token: str) -> dict[str, Any]:
+    """Trade a refresh token for a fresh access token."""
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        resp = await http.post(MCP_TOKEN_URL, data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+        })
         resp.raise_for_status()
         return resp.json()

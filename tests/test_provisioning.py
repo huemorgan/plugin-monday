@@ -1,7 +1,8 @@
-"""Cloud key-provisioning contract for plugin-monday.
+"""Cloud key-provisioning and transport contract for plugin-monday.
 
-GraphQL data calls route through `LUNA_MONDAY_BASE_URL` when set; the OAuth
-token exchange stays on the real auth host (not proxied).
+Direct transport (pasted token / gateway key) routes GraphQL through
+`LUNA_MONDAY_BASE_URL` when set; the OAuth transport always talks to
+monday's MCP passthrough host and is never proxied.
 """
 
 from __future__ import annotations
@@ -11,7 +12,13 @@ import tomllib
 from pathlib import Path
 
 from plugin_monday import MondayPlugin
-from plugin_monday.client import API_URL, AUTH_URL, MondayClient
+from plugin_monday.client import (
+    API_URL,
+    MCP_AUTHORIZE_URL,
+    MCP_REGISTER_URL,
+    MCP_TOKEN_URL,
+    MondayClient,
+)
 
 PKG = Path(__file__).resolve().parents[1] / "plugin_monday"
 
@@ -19,16 +26,25 @@ PKG = Path(__file__).resolve().parents[1] / "plugin_monday"
 def test_client_uses_base_url_override() -> None:
     c = MondayClient("tok", base_url="https://gw.example/proxy/monday")
     assert c._api_url == "https://gw.example/proxy/monday"
+    assert c.transport == "direct"
 
 
 def test_client_defaults_to_real_upstream() -> None:
     c = MondayClient("tok")
     assert c._api_url == API_URL
+    assert c.transport == "direct"
 
 
-def test_oauth_host_is_not_proxied() -> None:
-    # The OAuth token exchange must always hit the real Monday auth host.
-    assert AUTH_URL == "https://auth.monday.com/oauth2/token"
+def test_oauth_endpoints_are_monday_mcp_host() -> None:
+    # No-app OAuth (DCR) lives on mcp.monday.com and is never proxied.
+    assert MCP_REGISTER_URL == "https://mcp.monday.com/register"
+    assert MCP_AUTHORIZE_URL == "https://mcp.monday.com/authorize"
+    assert MCP_TOKEN_URL == "https://mcp.monday.com/token"
+
+
+def test_oauth_client_uses_mcp_transport() -> None:
+    c = MondayClient("tok", oauth={"client_id": "cid", "refresh_token": "r", "expires_at": None})
+    assert c.transport == "oauth"
 
 
 def test_credential_slot_advertises_base_url_var() -> None:

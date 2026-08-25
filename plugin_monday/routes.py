@@ -1,7 +1,13 @@
-"""plugin-monday API routes — OAuth connect/callback, status, disconnect, webhook."""
+"""plugin-monday API routes — no-app OAuth (DCR + PKCE), token connect, status,
+disconnect, webhook receiver, and the iframe settings UI."""
 
+import base64
+import hashlib
+import json
 import logging
 import os
+import secrets
+import time
 import urllib.parse
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,30 +39,54 @@ log = logging.getLogger("plugin-monday.routes")
 
 VAULT_TOKEN_KEY = "plugin_monday.oauth"
 VAULT_ACCOUNT_KEY = "plugin_monday.account_id"
-VAULT_REDIRECT_KEY = "plugin_monday.oauth_redirect"
-
-MONDAY_AUTHORIZE_URL = "https://auth.monday.com/oauth2/authorize"
+VAULT_OAUTH_BUNDLE_KEY = "plugin_monday.oauth2"
+VAULT_DCR_CLIENT_KEY = "plugin_monday.dcr_client"
+VAULT_OAUTH_PENDING_KEY = "plugin_monday.oauth_pending"
+VAULT_WEBHOOK_SECRET_KEY = "plugin_monday.webhook_secret"
 
 _SETTINGS_DIR = Path(__file__).parent / "interface" / "webui" / "settings"
 
 WEBHOOK_EVENT_MAP = {
+    "create_pulse": "monday.item.created",
     "create_item": "monday.item.created",
+    "update_column_value": "monday.column.changed",
     "change_column_value": "monday.column.changed",
+    "change_specific_column_value": "monday.column.changed",
     "change_status_column_value": "monday.status.changed",
+    "update_name": "monday.item.renamed",
+    "change_name": "monday.item.renamed",
     "create_update": "monday.update.created",
+    "edit_update": "monday.update.edited",
+    "delete_update": "monday.update.deleted",
     "create_subitem": "monday.subitem.created",
-    "delete_item": "monday.item.deleted",
+    "change_subitem_column_value": "monday.subitem.changed",
+    "delete_pulse": "monday.item.deleted",
+    "item_deleted": "monday.item.deleted",
+    "item_archived": "monday.item.archived",
+    "item_restored": "monday.item.restored",
+    "item_moved_to_any_group": "monday.item.moved",
+    "item_moved_to_specific_group": "monday.item.moved",
+    "when_date_arrived": "monday.date.arrived",
 }
 
 
 class _StatusResp(BaseModel):
     connected: bool
+    method: str | None = None
     account_name: str | None = None
     board_count: int | None = None
 
 
 class _TokenReq(BaseModel):
     token: str
+
+
+def _pkce_pair() -> tuple[str, str]:
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()
+    ).rstrip(b"=").decode()
+    return verifier, challenge
 
 
 def register_routes(app, ctx):
@@ -70,98 +100,133 @@ def register_routes(app, ctx):
             raise HTTPException(503, "Vault not available")
         return vault
 
-    def _client_id() -> str:
-        cid = os.environ.get("LUNA_MONDAY_CLIENT_ID", "")
-        if not cid:
-            raise HTTPException(500, "LUNA_MONDAY_CLIENT_ID not configured")
-        return cid
+    async def _vault_json(key: str) -> dict | None:
+        try:
+            raw = (await _vault().get_credential(key)).value
+        except KeyError:
+            return None
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            return None
 
-    def _client_secret() -> str:
-        secret = os.environ.get("LUNA_MONDAY_CLIENT_SECRET", "")
-        if not secret:
-            raise HTTPException(500, "LUNA_MONDAY_CLIENT_SECRET not configured")
-        return secret
+    async def _persist_bundle(bundle: dict) -> None:
+        await _vault().store_credential(
+            VAULT_OAUTH_BUNDLE_KEY, json.dumps(bundle), kind="oauth",
+        )
 
     @router.get("/connect")
     async def connect(request: Request, user=Depends(get_current_user)):
-        """Redirect the user to Monday.com OAuth consent screen."""
-        from fastapi.responses import HTMLResponse, RedirectResponse
+        """Start the no-app OAuth flow: self-register a client with monday
+        (Dynamic Client Registration — nothing to install), then redirect the
+        popup to monday's consent screen with PKCE + state."""
+        from fastapi.responses import RedirectResponse
 
-        cid = os.environ.get("LUNA_MONDAY_CLIENT_ID", "")
-        if not cid:
-            return HTMLResponse(
-                "<html><body style='font-family:sans-serif;padding:40px;background:#1a1a2e;color:#e0e0e0'>"
-                "<h2>Monday.com OAuth not configured</h2>"
-                "<p>Set <code>LUNA_MONDAY_CLIENT_ID</code> and "
-                "<code>LUNA_MONDAY_CLIENT_SECRET</code> environment variables to enable Monday.com integration.</p>"
-                "<p><a href='https://monday.com/developers/apps' style='color:#7c5cff'>Create a Monday app →</a></p>"
-                "<button onclick='window.close()' style='margin-top:16px;padding:8px 20px;border-radius:8px;"
-                "background:#7c5cff;color:white;border:none;cursor:pointer;font-size:14px'>Close</button>"
-                "</body></html>",
-                status_code=200,
+        from .client import MCP_AUTHORIZE_URL, dcr_register
+
+        vault = _vault()
+        public_base = _public_base(request)
+        redirect_uri = f"{public_base}/api/p/plugin-monday/callback"
+
+        # One registered client per redirect_uri; re-register if the Luna
+        # origin changed since last time.
+        dcr = await _vault_json(VAULT_DCR_CLIENT_KEY)
+        if not dcr or dcr.get("redirect_uri") != redirect_uri:
+            reg = await dcr_register(redirect_uri, client_name="Luna")
+            dcr = {"client_id": reg["client_id"], "redirect_uri": redirect_uri}
+            await vault.store_credential(
+                VAULT_DCR_CLIENT_KEY, json.dumps(dcr), kind="metadata",
             )
 
-        base_url = _public_base(request)
-        redirect_uri = f"{base_url}/api/p/plugin-monday/callback"
-        # The token exchange must repeat this exact redirect_uri, but on the
-        # callback request the referer points at monday — persist it instead.
-        await _vault().store_credential(VAULT_REDIRECT_KEY, redirect_uri, kind="metadata")
-        params = urllib.parse.urlencode({
-            "client_id": cid,
+        verifier, challenge = _pkce_pair()
+        state = secrets.token_urlsafe(24)
+        await vault.store_credential(VAULT_OAUTH_PENDING_KEY, json.dumps({
+            "state": state,
+            "verifier": verifier,
             "redirect_uri": redirect_uri,
+            "public_base": public_base,
+            "client_id": dcr["client_id"],
+        }), kind="metadata")
+
+        params = urllib.parse.urlencode({
+            "response_type": "code",
+            "client_id": dcr["client_id"],
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
         })
-        return RedirectResponse(f"{MONDAY_AUTHORIZE_URL}?{params}")
+        return RedirectResponse(f"{MCP_AUTHORIZE_URL}?{params}")
 
     @router.get("/callback")
-    async def callback(request: Request, code: str = ""):
-        """OAuth callback — exchange code for token, store in vault."""
+    async def callback(request: Request, code: str = "", state: str = ""):
+        """OAuth callback — verify state, exchange code (PKCE), store tokens."""
+        from fastapi.responses import HTMLResponse
+
+        from .client import client_from_bundle, dcr_exchange_code
+
         if not code:
             raise HTTPException(400, "Missing authorization code")
 
-        from .client import MondayClient, exchange_code
-
-        client_id = _client_id()
-        client_secret = _client_secret()
-
-        try:
-            redirect_uri = (await _vault().get_credential(VAULT_REDIRECT_KEY)).value
-        except KeyError:
-            redirect_uri = f"{_public_base(request)}/api/p/plugin-monday/callback"
-        token_data = await exchange_code(client_id, client_secret, code, redirect_uri)
-        token = token_data.get("access_token")
-        if not token:
-            raise HTTPException(502, "No access_token in Monday response")
-
         vault = _vault()
-        await vault.store_credential(VAULT_TOKEN_KEY, token, kind="oauth")
+        pending = await _vault_json(VAULT_OAUTH_PENDING_KEY)
+        if not pending or not state or pending.get("state") != state:
+            raise HTTPException(400, "OAuth state mismatch — restart the connect flow")
+        try:
+            await vault.delete_credential(VAULT_OAUTH_PENDING_KEY)
+        except KeyError:
+            pass
 
-        client = MondayClient(token)
+        tok = await dcr_exchange_code(
+            pending["client_id"], code, pending["redirect_uri"], pending["verifier"],
+        )
+        if not tok.get("access_token"):
+            raise HTTPException(502, "No access_token in monday response")
+
+        bundle = {
+            "client_id": pending["client_id"],
+            "access_token": tok["access_token"],
+            "refresh_token": tok.get("refresh_token", ""),
+            "expires_at": time.time() + float(tok.get("expires_in", 3600)),
+            "public_base": pending["public_base"],
+        }
+        await _persist_bundle(bundle)
+
+        client = client_from_bundle(bundle, on_refresh=_persist_bundle)
+        account_name = ""
+        account_id = ""
         try:
             account_data = await client.get_account()
-            account_name = account_data.get("me", {}).get("account", {}).get("name", "")
-            account_id = str(account_data.get("me", {}).get("account", {}).get("id", ""))
+            account = account_data.get("me", {}).get("account", {}) or {}
+            account_name = account.get("name", "")
+            account_id = str(account.get("id", "") or "")
             if account_id:
                 await vault.store_credential(VAULT_ACCOUNT_KEY, account_id, kind="metadata")
-        finally:
-            await client.close()
+        except Exception as exc:  # noqa: BLE001 — connected even if probe fails
+            log.warning("plugin-monday: post-connect account probe failed: %s", exc)
 
-        set_client(MondayClient(token))
+        old = get_client()
+        if old is not None:
+            await old.close()
+        set_client(client)
 
         await ctx.events.emit("monday.connected", {
             "account_name": account_name,
             "account_id": account_id,
         })
 
-        from fastapi.responses import HTMLResponse
         return HTMLResponse(
-            "<html><body><script>window.close()</script>"
-            "<p>Monday.com connected. You can close this tab.</p></body></html>"
+            "<html><body style='font-family:sans-serif;background:#0b0e14;color:#e6e9f2;"
+            "display:flex;align-items:center;justify-content:center;height:100vh'>"
+            "<p>Monday.com connected — you can close this window.</p>"
+            "<script>try{if(window.opener){window.opener.postMessage('monday-connected','*')}}catch(e){}"
+            "window.close()</script></body></html>"
         )
 
     @router.post("/connect-token")
     async def connect_token(body: _TokenReq, user=Depends(get_current_user)):
         """Connect with a personal API token (monday.com → Developers → My
-        access tokens) — no OAuth app or client-id/secret env vars needed."""
+        access tokens) — fallback path, talks to the API directly."""
         from .client import MondayClient
 
         token = body.token.strip()
@@ -198,14 +263,12 @@ def register_routes(app, ctx):
     @router.post("/disconnect")
     async def disconnect(user=Depends(get_current_user)):
         vault = _vault()
-        try:
-            await vault.delete_credential(VAULT_TOKEN_KEY)
-        except KeyError:
-            pass
-        try:
-            await vault.delete_credential(VAULT_ACCOUNT_KEY)
-        except KeyError:
-            pass
+        for key in (VAULT_OAUTH_BUNDLE_KEY, VAULT_TOKEN_KEY, VAULT_ACCOUNT_KEY,
+                    VAULT_OAUTH_PENDING_KEY):
+            try:
+                await vault.delete_credential(key)
+            except KeyError:
+                pass
 
         client = get_client()
         if client is not None:
@@ -216,11 +279,15 @@ def register_routes(app, ctx):
 
     @router.get("/status", response_model=_StatusResp)
     async def status(user=Depends(get_current_user)):
-        vault = _vault()
-        try:
-            await vault.get_credential(VAULT_TOKEN_KEY)
-        except KeyError:
-            return _StatusResp(connected=False)
+        method = None
+        if await _vault_json(VAULT_OAUTH_BUNDLE_KEY):
+            method = "oauth"
+        else:
+            try:
+                await _vault().get_credential(VAULT_TOKEN_KEY)
+                method = "token"
+            except KeyError:
+                return _StatusResp(connected=False)
 
         client = get_client()
         account_name = None
@@ -236,16 +303,26 @@ def register_routes(app, ctx):
 
         return _StatusResp(
             connected=True,
+            method=method,
             account_name=account_name,
             board_count=board_count,
         )
 
     @router.post("/webhook/{secret}")
     async def webhook(request: Request, secret: str):
-        """Receive Monday.com webhook events. Monday embeds the secret in the URL."""
+        """Receive Monday.com webhook events. The per-install secret is
+        embedded in the URL our webhook tools register with monday."""
+        expected = None
+        try:
+            expected = (await _vault().get_credential(VAULT_WEBHOOK_SECRET_KEY)).value
+        except (KeyError, HTTPException):
+            pass
+        if expected and not secrets.compare_digest(secret, expected):
+            raise HTTPException(403, "unknown webhook secret")
+
         payload = await request.json()
 
-        # Monday sends a challenge on first webhook registration
+        # Monday sends a challenge on webhook registration
         if "challenge" in payload:
             return {"challenge": payload["challenge"]}
 
@@ -256,7 +333,8 @@ def register_routes(app, ctx):
             await ctx.events.emit(bus_event, payload)
             log.info("monday webhook: %s", bus_event)
         else:
-            log.info("monday webhook: unknown type %s", event_type)
+            await ctx.events.emit("monday.event", payload)
+            log.info("monday webhook: unmapped type %s", event_type)
 
         return {"ok": True}
 

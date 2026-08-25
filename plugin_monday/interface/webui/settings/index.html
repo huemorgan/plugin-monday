@@ -6,78 +6,94 @@
   <title>Monday.com settings</title>
   <style>
     :root {
-      --ink-950: #0a0b10; --ink-900: #11131b; --ink-800: #1a1d28;
-      --ink-500: #6b7280; --ink-400: #9ca3af; --ink-300: #c3c8d2; --ink-50: #f3f4f6;
-      --luna-600: #6d5efc; --luna-500: #8b7bff; --luna-400: #a99bff;
-      --green: #34d399; --red: #f87171;
+      --bg: #0b0e14; --panel: #11151f; --panel-2: #161b28; --line: #232a3a;
+      --text: #e6e9f2; --dim: #8b93a7; --faint: #5b6275;
+      --violet: #8b5cf6; --violet-soft: #a78bfa;
+      --ok: #3ad29f; --red: #f4645f; --radius: 12px;
     }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; background: transparent; }
     body {
-      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-      color: var(--ink-50); padding: 2rem; max-width: 46rem;
+      font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      font-size: 15px; color: var(--text); padding: 2rem; max-width: 44rem;
+      -webkit-font-smoothing: antialiased;
     }
-    h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .25rem; }
-    .sub { color: var(--ink-400); font-size: .85rem; margin: 0 0 1.5rem; line-height: 1.45; }
+    .eyebrow {
+      font-size: 11px; text-transform: uppercase; letter-spacing: 0.17em;
+      color: var(--faint); font-weight: 600; margin: 0 0 .4rem;
+    }
+    .headline { font-size: 22px; font-weight: 700; margin: 0 0 .3rem; display: flex; align-items: center; gap: .6rem; }
+    .support { font-size: 13px; color: var(--dim); margin: 0 0 1.1rem; line-height: 1.5; }
     .card {
-      background: rgba(17,19,27,.4); border: 1px solid rgba(255,255,255,.06);
-      border-radius: .75rem; padding: 1.25rem;
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: var(--radius); padding: 1.4rem 1.5rem;
     }
-    .row { display: flex; align-items: center; gap: .55rem; margin-bottom: .75rem; }
-    .dot { width: .55rem; height: .55rem; border-radius: 50%; }
-    .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
-    .dot.off { background: var(--ink-500); }
-    .meta { color: var(--ink-300); font-size: .85rem; margin-bottom: .35rem; }
-    .meta b { color: var(--ink-50); font-weight: 600; }
-    p.lead { color: var(--ink-300); font-size: .9rem; margin: 0 0 1rem; line-height: 1.45; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+    .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+    .dot.off { background: transparent; border: 1.5px solid var(--faint); }
     button {
       display: inline-flex; align-items: center; gap: .5rem; cursor: pointer;
-      border: none; border-radius: .5rem; font-size: .875rem; font-weight: 500;
-      padding: .6rem 1rem; color: #fff; transition: background .15s, opacity .15s; margin-top: .5rem;
+      border: none; border-radius: 8px; font-size: 14px; font-weight: 500;
+      padding: .65rem 1.15rem; color: #fff; transition: background .15s, opacity .15s;
+      font-family: inherit;
     }
-    button.primary { background: var(--luna-600); }
-    button.primary:hover { background: var(--luna-500); }
-    button.danger { background: rgba(220,38,38,.8); }
-    button.danger:hover { background: rgb(220,38,38); }
+    button.primary { background: var(--violet); }
+    button.primary:hover { background: var(--violet-soft); }
+    button.danger { background: transparent; border: 1px solid var(--line); color: var(--red); }
+    button.danger:hover { border-color: var(--red); }
     button:disabled { opacity: .5; cursor: default; }
     .err {
-      margin-bottom: 1rem; font-size: .85rem; color: #fecaca;
-      background: rgba(127,29,29,.3); border: 1px solid rgba(153,27,27,.5);
-      border-radius: .5rem; padding: .65rem .75rem;
+      margin: 0 0 1rem; font-size: 13px; color: var(--red);
+      background: var(--panel-2); border: 1px solid var(--line);
+      border-radius: 8px; padding: .65rem .8rem;
     }
-    .muted { color: var(--ink-400); font-size: .85rem; }
     .hidden { display: none; }
     .spinner {
       width: 1rem; height: 1rem; border: 2px solid rgba(255,255,255,.3);
       border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite;
-      display: inline-block; vertical-align: middle;
+      display: inline-block;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    details { margin-top: 1.2rem; border-top: 1px solid var(--line); padding-top: 1rem; }
+    summary { font-size: 13px; color: var(--faint); cursor: pointer; user-select: none; }
+    summary:hover { color: var(--dim); }
+    details p { font-size: 13px; color: var(--dim); line-height: 1.5; margin: .8rem 0 .6rem; }
+    details b { color: var(--text); font-weight: 600; }
+    input[type=password] {
+      width: 100%; padding: .6rem .75rem; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--panel-2);
+      color: var(--text); font-size: 14px; font-family: inherit; margin-bottom: .6rem;
+    }
+    input[type=password]:focus { outline: none; border-color: var(--violet); }
   </style>
 </head>
 <body>
-  <h1>Monday.com</h1>
-  <p class="sub">Connect Luna to your Monday.com account to manage boards, items, columns, and comments.</p>
-
   <div id="error" class="err hidden"></div>
-  <div id="loading" class="card muted"><span class="spinner"></span> <span style="vertical-align:middle">Loading…</span></div>
+
+  <div id="loading" class="card">
+    <p class="eyebrow">Connection</p>
+    <p class="headline"><span class="spinner"></span> Checking…</p>
+  </div>
 
   <div id="connected" class="card hidden">
-    <div class="row"><span class="dot on"></span><span style="font-weight:500">Connected</span></div>
-    <div id="account" class="meta hidden"></div>
-    <div id="boards" class="meta hidden"></div>
+    <p class="eyebrow">Connection</p>
+    <p class="headline"><span class="dot on"></span> Connected</p>
+    <p class="support" id="connected-support">Luna can read and write your Monday.com boards.</p>
     <button id="disconnect-btn" class="danger" data-testid="monday-disconnect-btn">Disconnect</button>
   </div>
 
   <div id="disconnected" class="card hidden">
-    <p class="lead">Paste a personal API token — in Monday.com click your avatar &rarr; <b>Developers</b> &rarr; <b>My access tokens</b> &rarr; Copy.</p>
-    <input id="token-input" type="password" placeholder="API token" autocomplete="off"
-           data-testid="monday-token-input"
-           style="width:100%;padding:.6rem .75rem;border-radius:.5rem;border:1px solid rgba(255,255,255,.12);background:rgba(10,11,16,.6);color:var(--ink-50);font-size:.875rem" />
-    <button id="token-btn" class="primary" data-testid="monday-token-btn">Connect with token</button>
-    <p class="lead" style="margin:1.25rem 0 .5rem">Or connect via OAuth (needs a Monday.com app configured on this server).</p>
-    <button id="connect-btn" data-testid="monday-connect-btn"
-            style="background:rgba(255,255,255,.08)">Connect with OAuth</button>
+    <p class="eyebrow">Connection</p>
+    <p class="headline"><span class="dot off"></span> Not connected</p>
+    <p class="support">Approve access in a Monday.com window — nothing to install or configure.</p>
+    <button id="connect-btn" class="primary" data-testid="monday-connect-btn">Connect Monday.com</button>
+    <details>
+      <summary>Use an API token instead</summary>
+      <p>In Monday.com: avatar &rarr; <b>Developers</b> &rarr; <b>My access tokens</b> &rarr; Copy.</p>
+      <input id="token-input" type="password" placeholder="API token" autocomplete="off"
+             data-testid="monday-token-input" />
+      <button id="token-btn" class="primary" data-testid="monday-token-btn">Connect with token</button>
+    </details>
   </div>
 
   <script>
@@ -105,12 +121,13 @@
         showError(null);
         if (s.connected) {
           show('connected');
-          if (s.account_name) { el('account').innerHTML = 'Account: <b>' + s.account_name + '</b>'; el('account').classList.remove('hidden'); }
-          else { el('account').classList.add('hidden'); }
-          if (s.board_count !== null && s.board_count !== undefined) {
-            el('boards').textContent = s.board_count + ' board' + (s.board_count !== 1 ? 's' : '');
-            el('boards').classList.remove('hidden');
-          } else { el('boards').classList.add('hidden'); }
+          const bits = [];
+          if (s.account_name) bits.push(s.account_name);
+          if (s.board_count !== null && s.board_count !== undefined) bits.push(s.board_count + ' board' + (s.board_count !== 1 ? 's' : ''));
+          if (s.method === 'token') bits.push('API token');
+          el('connected-support').textContent = bits.length
+            ? bits.join(' · ')
+            : 'Luna can read and write your Monday.com boards.';
         } else {
           show('disconnected');
         }
@@ -118,12 +135,17 @@
     }
     function busy(btn, on, label) { btn.disabled = on; btn.innerHTML = on ? '<span class="spinner"></span>' + label : btn.dataset.label; }
 
+    let pollTimer = null;
     function connect() {
       const url = token ? BASE + '/connect?token=' + encodeURIComponent(token) : BASE + '/connect';
-      window.open(url, '_blank', 'width=600,height=700');
-      const interval = setInterval(refresh, 2000);
-      setTimeout(() => clearInterval(interval), 120000);
+      window.open(url, '_blank', 'width=620,height=760');
+      clearInterval(pollTimer);
+      pollTimer = setInterval(refresh, 2000);
+      setTimeout(() => clearInterval(pollTimer), 180000);
     }
+    window.addEventListener('message', (e) => {
+      if (e.data === 'monday-connected') { clearInterval(pollTimer); refresh(); }
+    });
     async function connectToken() {
       const input = el('token-input');
       const value = (input.value || '').trim();

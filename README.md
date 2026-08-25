@@ -1,8 +1,8 @@
 # plugin-monday
 
-Monday.com board and item management for [Luna](https://github.com/huemorgan/luna)
-via the Monday GraphQL API: boards, groups, items, subitems, status/columns, and
-updates (comments).
+Monday.com for [Luna](https://github.com/huemorgan/luna) via the Monday
+GraphQL API: boards, groups, items, subitems, columns, updates (comments),
+webhook change triggers, and raw GraphQL for everything else.
 
 This is a **Luna plugin** built against the Luna Plugin SDK (`luna_sdk`) v0. It
 imports nothing from `luna.*` — only the stable SDK surface (including
@@ -12,50 +12,64 @@ marketplace and runs without being part of Luna core.
 ## Install
 
 In Luna: **Marketplace → Luna Official → plugin-monday → Install**. Then open
-**Settings → Connectors → Monday.com** and click **Connect Monday.com** to run
-the OAuth flow.
+**Settings → Monday.com** and click **Connect Monday.com** — approve the popup,
+done.
 
-## Auth (OAuth 2.0)
+## Auth — no-app OAuth (Dynamic Client Registration)
 
-Connects via Monday's OAuth. The connect → callback → token-persist loop runs
-entirely from the plugin's managed directory. Requires a Monday app's
-credentials in the host environment:
+No monday app to create, no client-id/secret env vars, nothing to install on
+the monday side. The plugin self-registers a public OAuth client with monday
+(RFC 7591 Dynamic Client Registration on `mcp.monday.com`) and runs the
+standard authorization-code + PKCE + state flow in a popup. Access tokens live
+7 days and refresh automatically with the issued refresh token.
 
-| Var | Purpose |
-|---|---|
-| `LUNA_MONDAY_CLIENT_ID` | Monday app client ID |
-| `LUNA_MONDAY_CLIENT_SECRET` | Monday app client secret |
+DCR tokens are rejected by `api.monday.com/v2` (verified: 401), so GraphQL
+executes through monday's `all_api_read` / `all_api_write` passthrough on
+`mcp.monday.com/mcp` — plain JSON-RPC over HTTPS, no MCP SDK, no session
+state, full read/write API surface.
 
-Set the app's redirect URI to `<luna-origin>/api/p/plugin-monday/callback`.
+Fallback: paste a **personal API token** (monday.com → avatar → Developers →
+My access tokens); that path talks to `api.monday.com/v2` directly and also
+serves gateway key-provisioning via `LUNA_MONDAY_API_KEY` /
+`LUNA_MONDAY_BASE_URL`.
 
 ## What it does
 
-17 skill-gated tools across four skills:
+28 skill-gated tools across six skills:
 
 | Skill | Tools |
 |---|---|
-| `monday-boards` | list/get boards, list/create groups |
+| `monday-boards` | list/get/create/archive boards, groups, workspaces, users |
 | `monday-items` | list/get/create/update/delete/move/archive items |
-| `monday-columns` | set status, get column values |
+| `monday-columns` | set status, get column values, create/delete columns |
 | `monday-updates` | create/list updates, create/list subitems |
+| `monday-webhooks` | create/list/delete board webhooks (change triggers) |
+| `monday-api` | raw GraphQL query + mutation — the whole API |
 
-The OAuth token is stored in Luna's vault; auth-gated REST routes live under
-`/api/p/plugin-monday/*` (including a webhook receiver).
+## Change triggers (webhooks)
+
+`monday_create_webhook` subscribes a board to a monday event
+(`create_item`, `change_column_value`, `change_status_column_value`,
+`item_deleted`, `create_update`, `when_date_arrived`, ...) delivered to the
+plugin's receiver (`/api/p/plugin-monday/webhook/{secret}` — per-install
+secret, challenge echo handled). Events re-emit on Luna's event bus as
+`monday.*` (`monday.item.created`, `monday.column.changed`,
+`monday.status.changed`, ...) for playbooks and schedulers.
 
 ## Settings UI
 
 Served as a themed **iframe** from the plugin's own managed directory
-(`interface/webui/settings/index.html`) — ships its own UI without compiling
-into Luna core's bundle. Crash-isolated and React-version immune.
+(`interface/webui/settings/index.html`) — OAuth-first connect button, token
+paste behind an expandable detail.
 
 ## Layout
 
 ```
 plugin_monday/
   __init__.py        # the plugin (luna_sdk only) — tools + skills + settings tab
-  client.py          # MondayClient + exchange_code (pure httpx)
-  routes.py          # OAuth connect/callback, status, disconnect, webhook + iframe UI
-  state.py           # process-level MondayClient holder (OAuth hot-swap, no registry reach-in)
+  client.py          # MondayClient (oauth/direct transports) + DCR helpers
+  routes.py          # OAuth connect/callback (PKCE+state), status, disconnect, webhook receiver
+  state.py           # process-level MondayClient holder (OAuth hot-swap)
   interface/webui/settings/index.html   # the iframe settings page (OAuth popup)
   luna-plugin.toml   # the data manifest the marketplace reads
 ```

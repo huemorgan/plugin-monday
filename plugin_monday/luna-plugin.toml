@@ -1,29 +1,33 @@
 name = "plugin-monday"
 shown_name = "Monday.com"
-version = "0.2.4"
-description = "Monday.com board and item management via GraphQL."
+version = "0.3.0"
+description = "Monday.com boards, items, webhooks, and full API access via GraphQL."
 entry = "plugin_monday"
 sdk_version = "0"
 license = "MIT"
-tags = ["connector", "monday", "project-management", "oauth"]
+tags = ["connector", "monday", "project-management", "oauth", "webhooks"]
 readme = """
 # plugin-monday
 
-Manage Monday.com from Luna — boards, groups, items, subitems, status/columns,
-and updates (comments) over the GraphQL API. Connects with a **personal API
-token** (monday.com → avatar → Developers → My access tokens) or via
-**OAuth 2.0**. Settings UI served as a themed iframe.
+Manage Monday.com from Luna — boards, groups, items, subitems, columns,
+updates (comments), webhook change triggers, and raw GraphQL for everything
+else.
 
-OAuth additionally requires `LUNA_MONDAY_CLIENT_ID` + `LUNA_MONDAY_CLIENT_SECRET`
-env vars (your Monday app credentials); the token path needs nothing.
+Connects with **one-click OAuth**: click Connect, approve in the Monday.com
+popup, done. No monday app to create or install, no server configuration —
+the plugin self-registers with monday (OAuth Dynamic Client Registration)
+and refreshes tokens automatically. A **personal API token** paste remains
+as a fallback.
+
+Board webhooks (item created, column changed, status changed, ...) are
+re-emitted on Luna's event bus as `monday.*` events for playbooks to react to.
 
 Source: https://github.com/huemorgan/plugin-monday
 """
 
 [requires]
-tools = 17
+tools = 28
 depends_on = ["plugin-vault"]
-env = ["LUNA_MONDAY_CLIENT_ID", "LUNA_MONDAY_CLIENT_SECRET"]
 
 [[tools]]
 name = "monday_list_boards"
@@ -38,6 +42,18 @@ policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
+name = "monday_create_board"
+description = "Create a new board."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_archive_board"
+description = "Archive a board."
+policy = "ask"
+risk_level = "high"
+
+[[tools]]
 name = "monday_list_groups"
 description = "List groups in a board."
 policy = "auto_approve"
@@ -48,6 +64,18 @@ name = "monday_create_group"
 description = "Create a new group in a board."
 policy = "ask"
 risk_level = "medium"
+
+[[tools]]
+name = "monday_list_workspaces"
+description = "List workspaces."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_list_users"
+description = "List account users."
+policy = "auto_approve"
+risk_level = "low"
 
 [[tools]]
 name = "monday_list_items"
@@ -104,6 +132,18 @@ policy = "auto_approve"
 risk_level = "low"
 
 [[tools]]
+name = "monday_create_column"
+description = "Add a column to a board."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_delete_column"
+description = "Delete a column from a board."
+policy = "ask"
+risk_level = "high"
+
+[[tools]]
 name = "monday_create_update"
 description = "Post a comment (update) on an item."
 policy = "ask"
@@ -126,3 +166,33 @@ name = "monday_list_subitems"
 description = "List subitems of an item."
 policy = "auto_approve"
 risk_level = "low"
+
+[[tools]]
+name = "monday_create_webhook"
+description = "Subscribe to change events on a board."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_list_webhooks"
+description = "List webhooks on a board."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_delete_webhook"
+description = "Delete a webhook subscription."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_api_query"
+description = "Run any read-only GraphQL query."
+policy = "auto_approve"
+risk_level = "low"
+
+[[tools]]
+name = "monday_api_mutate"
+description = "Run any GraphQL mutation."
+policy = "ask"
+risk_level = "high"

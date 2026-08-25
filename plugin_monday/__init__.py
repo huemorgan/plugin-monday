@@ -1,14 +1,18 @@
 """plugin-monday — Monday.com board/item management via GraphQL.
 
-Connects Luna to Monday.com via OAuth 2.0. All tools are skill-gated;
-the agent loads monday-boards, monday-items, monday-columns, or
-monday-updates skills to gain access.
+Connects Luna to Monday.com with the no-app OAuth flow (Dynamic Client
+Registration — the user just approves a popup; no monday app is created or
+installed) or a pasted personal API token. All tools are skill-gated; the
+agent loads monday-boards, monday-items, monday-columns, monday-updates,
+monday-webhooks, or monday-api skills to gain access.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import secrets
 from typing import Any
 
 from luna_sdk import (
@@ -21,13 +25,15 @@ from luna_sdk import (
     ToolDef,
 )
 
-from .client import MondayClient
+from .client import MondayClient, client_from_bundle
 from .state import get_client, set_client
 
 log = logging.getLogger("plugin-monday")
 
 VAULT_TOKEN_KEY = "plugin_monday.oauth"
 VAULT_ACCOUNT_KEY = "plugin_monday.account_id"
+VAULT_OAUTH_BUNDLE_KEY = "plugin_monday.oauth2"
+VAULT_WEBHOOK_SECRET_KEY = "plugin_monday.webhook_secret"
 ENV_KEY = "LUNA_MONDAY_API_KEY"
 ENV_BASE_URL = "LUNA_MONDAY_BASE_URL"
 
@@ -38,8 +44,8 @@ class MondayPlugin(LunaPlugin):
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.2.4",
-        description="Monday.com board and item management via GraphQL.",
+        version="0.3.0",
+        description="Monday.com boards, items, webhooks, and full API access via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
         routes_module="routes",
@@ -58,7 +64,7 @@ class MondayPlugin(LunaPlugin):
     def credential_slots(self) -> list[CredentialSlot]:
         # env_base_url_var marks monday proxy-provisionable: the gateway sets
         # LUNA_MONDAY_BASE_URL (={gateway}/proxy/monday) + the token via
-        # LUNA_MONDAY_API_KEY. Only GraphQL data calls proxy; OAuth stays direct.
+        # LUNA_MONDAY_API_KEY. Only direct GraphQL calls proxy; OAuth stays direct.
         return [
             CredentialSlot(
                 slug="monday",
@@ -70,22 +76,48 @@ class MondayPlugin(LunaPlugin):
         ]
 
     async def on_load(self, ctx: PluginContext) -> None:
+        self._ctx = ctx
         set_client(None)
 
-        # Token: vault first (OAuth token), then env (the gateway token in proxy
-        # mode). Base-url: env only — when set, route GraphQL through the proxy.
-        token = await self._resolve_token(ctx)
-        base_url = self._resolve_base_url(ctx)
-
-        if token:
-            set_client(MondayClient(token, base_url=base_url))
+        # Auth precedence: OAuth bundle (the no-app popup flow) → vault token
+        # (pasted personal token) → env (gateway token in proxy mode).
+        bundle = await self._resolve_bundle(ctx)
+        if bundle:
+            set_client(client_from_bundle(bundle, on_refresh=self._persist_bundle))
+        else:
+            token = await self._resolve_token(ctx)
+            if token:
+                set_client(MondayClient(token, base_url=self._resolve_base_url(ctx)))
 
         self._register_tools(ctx)
         self._register_skills(ctx)
         log.info(
-            "plugin-monday loaded (tools=17, connected=%s, gateway=%s)",
-            get_client() is not None, bool(base_url),
+            "plugin-monday loaded (tools=28, connected=%s, transport=%s)",
+            get_client() is not None,
+            getattr(get_client(), "transport", None),
         )
+
+    async def _resolve_bundle(self, ctx: PluginContext) -> dict[str, Any] | None:
+        vault = getattr(ctx, "vault", None)
+        if vault is None:
+            return None
+        try:
+            raw = (await vault.get_credential(VAULT_OAUTH_BUNDLE_KEY)).value
+            bundle = json.loads(raw)
+            if bundle.get("access_token") and bundle.get("client_id"):
+                return bundle
+        except KeyError:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            log.warning("plugin-monday: oauth bundle read failed: %s", exc)
+        return None
+
+    async def _persist_bundle(self, bundle: dict[str, Any]) -> None:
+        vault = getattr(self._ctx, "vault", None)
+        if vault is not None:
+            await vault.store_credential(
+                VAULT_OAUTH_BUNDLE_KEY, json.dumps(bundle), kind="oauth",
+            )
 
     async def _resolve_token(self, ctx: PluginContext) -> str | None:
         vault = getattr(ctx, "vault", None)
@@ -124,6 +156,32 @@ class MondayPlugin(LunaPlugin):
                 "Monday.com not connected. Ask the owner to connect in Settings > Monday.com."
             )
         return client
+
+    async def _webhook_url(self) -> str:
+        """Public URL monday should deliver webhook events to."""
+        vault = getattr(self._ctx, "vault", None)
+        if vault is None:
+            raise RuntimeError("Vault not available")
+        try:
+            secret = (await vault.get_credential(VAULT_WEBHOOK_SECRET_KEY)).value
+        except KeyError:
+            secret = secrets.token_urlsafe(24)
+            await vault.store_credential(VAULT_WEBHOOK_SECRET_KEY, secret, kind="metadata")
+
+        base = ""
+        try:
+            raw = (await vault.get_credential(VAULT_OAUTH_BUNDLE_KEY)).value
+            base = (json.loads(raw).get("public_base") or "").rstrip("/")
+        except (KeyError, ValueError):
+            pass
+        if not base:
+            base = (os.environ.get("LUNA_BASE_URL") or "").rstrip("/")
+        if not base:
+            raise RuntimeError(
+                "No public base URL known for webhook delivery. Connect via OAuth "
+                "in Settings > Monday.com, or set LUNA_BASE_URL."
+            )
+        return f"{base}/api/p/plugin-monday/webhook/{secret}"
 
     # ── tools ─────────────────────────────────────────────────
 
@@ -175,6 +233,54 @@ class MondayPlugin(LunaPlugin):
             _get_board,
         )
 
+        async def _create_board(
+            board_name: str,
+            board_kind: str = "public",
+            workspace_id: int | None = None,
+            description: str | None = None,
+        ) -> dict[str, Any]:
+            return await self._get_client().create_board(
+                board_name, board_kind=board_kind,
+                workspace_id=workspace_id, description=description,
+            )
+
+        _reg(
+            ToolDef(
+                name="monday_create_board",
+                description="Create a new Monday.com board.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_name": {"type": "string", "description": "Name for the new board."},
+                        "board_kind": {"type": "string", "description": "public, private, or share.", "default": "public"},
+                        "workspace_id": {"type": "integer", "description": "Workspace to create the board in."},
+                        "description": {"type": "string", "description": "Board description."},
+                    },
+                    "required": ["board_name"],
+                },
+            ),
+            _create_board,
+        )
+
+        async def _archive_board(board_id: int) -> dict[str, Any]:
+            return await self._get_client().archive_board(board_id)
+
+        _reg(
+            ToolDef(
+                name="monday_archive_board",
+                description="Archive a Monday.com board.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_id": {"type": "integer", "description": "The board ID."},
+                    },
+                    "required": ["board_id"],
+                },
+                risk_level="high",
+            ),
+            _archive_board,
+        )
+
         async def _list_groups(board_id: int) -> dict[str, Any]:
             return {"groups": await self._get_client().list_groups(board_id)}
 
@@ -210,6 +316,42 @@ class MondayPlugin(LunaPlugin):
                 },
             ),
             _create_group,
+        )
+
+        # --- workspaces / users ---
+
+        async def _list_workspaces(limit: int = 50) -> dict[str, Any]:
+            return {"workspaces": await self._get_client().list_workspaces(limit=limit)}
+
+        _reg(
+            ToolDef(
+                name="monday_list_workspaces",
+                description="List Monday.com workspaces.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Max workspaces to return.", "default": 50},
+                    },
+                },
+            ),
+            _list_workspaces,
+        )
+
+        async def _list_users(limit: int = 100) -> dict[str, Any]:
+            return {"users": await self._get_client().list_users(limit=limit)}
+
+        _reg(
+            ToolDef(
+                name="monday_list_users",
+                description="List users in the Monday.com account (for assignments).",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "description": "Max users to return.", "default": 100},
+                    },
+                },
+            ),
+            _list_users,
         )
 
         # --- items ---
@@ -409,6 +551,55 @@ class MondayPlugin(LunaPlugin):
             _get_column_values,
         )
 
+        async def _create_column(
+            board_id: int, title: str, column_type: str,
+            defaults: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            return await self._get_client().create_column(
+                board_id, title, column_type, defaults=defaults,
+            )
+
+        _reg(
+            ToolDef(
+                name="monday_create_column",
+                description=(
+                    "Add a column to a Monday.com board. column_type is a monday "
+                    "ColumnType like status, text, numbers, date, people, checkbox."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_id": {"type": "integer", "description": "The board ID."},
+                        "title": {"type": "string", "description": "Column title."},
+                        "column_type": {"type": "string", "description": "monday ColumnType (status, text, numbers, date, people, ...)."},
+                        "defaults": {"type": "object", "description": "Type-specific default settings (e.g. status labels)."},
+                    },
+                    "required": ["board_id", "title", "column_type"],
+                },
+            ),
+            _create_column,
+        )
+
+        async def _delete_column(board_id: int, column_id: str) -> dict[str, Any]:
+            return await self._get_client().delete_column(board_id, column_id)
+
+        _reg(
+            ToolDef(
+                name="monday_delete_column",
+                description="Delete a column (and all its values) from a Monday.com board.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_id": {"type": "integer", "description": "The board ID."},
+                        "column_id": {"type": "string", "description": "The column ID."},
+                    },
+                    "required": ["board_id", "column_id"],
+                },
+                risk_level="high",
+            ),
+            _delete_column,
+        )
+
         # --- updates (comments) ---
 
         async def _create_update(item_id: int, body: str) -> dict[str, Any]:
@@ -495,6 +686,130 @@ class MondayPlugin(LunaPlugin):
             _list_subitems,
         )
 
+        # --- webhooks (change triggers) ---
+
+        async def _create_webhook(
+            board_id: int, event: str, config: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            url = await self._webhook_url()
+            hook = await self._get_client().create_webhook(
+                board_id, url, event, config=config,
+            )
+            return {"webhook": hook, "delivers_to": url}
+
+        _reg(
+            ToolDef(
+                name="monday_create_webhook",
+                description=(
+                    "Subscribe to change events on a Monday.com board. Events are "
+                    "delivered to Luna and re-emitted on the event bus as monday.* "
+                    "(e.g. monday.item.created, monday.column.changed). Common "
+                    "event values: create_item, change_column_value, "
+                    "change_status_column_value, change_specific_column_value, "
+                    "item_deleted, item_archived, item_moved_to_any_group, "
+                    "create_update, create_subitem, when_date_arrived. "
+                    "change_specific_column_value takes config {\"columnId\": ...}."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_id": {"type": "integer", "description": "The board ID to watch."},
+                        "event": {"type": "string", "description": "monday WebhookEventType (e.g. create_item, change_column_value)."},
+                        "config": {"type": "object", "description": "Event config, e.g. {\"columnId\": \"status\"} for column-specific events."},
+                    },
+                    "required": ["board_id", "event"],
+                },
+            ),
+            _create_webhook,
+        )
+
+        async def _list_webhooks(board_id: int) -> dict[str, Any]:
+            return {"webhooks": await self._get_client().list_webhooks(board_id)}
+
+        _reg(
+            ToolDef(
+                name="monday_list_webhooks",
+                description="List webhooks registered on a Monday.com board.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_id": {"type": "integer", "description": "The board ID."},
+                    },
+                    "required": ["board_id"],
+                },
+            ),
+            _list_webhooks,
+        )
+
+        async def _delete_webhook(webhook_id: int) -> dict[str, Any]:
+            return await self._get_client().delete_webhook(webhook_id)
+
+        _reg(
+            ToolDef(
+                name="monday_delete_webhook",
+                description="Delete a Monday.com webhook subscription.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "webhook_id": {"type": "integer", "description": "The webhook ID."},
+                    },
+                    "required": ["webhook_id"],
+                },
+            ),
+            _delete_webhook,
+        )
+
+        # --- raw API (anything the dedicated tools don't cover) ---
+
+        async def _api_query(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+            if query.lstrip().startswith("mutation"):
+                raise RuntimeError("Use monday_api_mutate for mutations.")
+            return await self._get_client().api(query, variables)
+
+        _reg(
+            ToolDef(
+                name="monday_api_query",
+                description=(
+                    "Run any read-only GraphQL query against the Monday.com API. "
+                    "Covers every API read the dedicated tools don't."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "GraphQL query document."},
+                        "variables": {"type": "object", "description": "GraphQL variables."},
+                    },
+                    "required": ["query"],
+                },
+            ),
+            _api_query,
+        )
+
+        async def _api_mutate(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+            if not query.lstrip().startswith("mutation"):
+                raise RuntimeError("monday_api_mutate only accepts mutation documents.")
+            return await self._get_client().api(query, variables)
+
+        _reg(
+            ToolDef(
+                name="monday_api_mutate",
+                description=(
+                    "Run any GraphQL mutation against the Monday.com API. "
+                    "Covers every API write the dedicated tools don't."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "GraphQL mutation document."},
+                        "variables": {"type": "object", "description": "GraphQL variables."},
+                    },
+                    "required": ["query"],
+                },
+                risk_level="high",
+            ),
+            _api_mutate,
+        )
+
     # ── skills ────────────────────────────────────────────────
 
     def _register_skills(self, ctx: PluginContext) -> None:
@@ -508,21 +823,27 @@ class MondayPlugin(LunaPlugin):
             SkillDef(
                 name="monday-boards",
                 description=(
-                    "Monday.com board management — list, inspect boards, "
-                    "and manage groups"
+                    "Monday.com board management — list, inspect, create, archive "
+                    "boards; groups, workspaces, and users"
                 ),
                 body=(
                     "You now have access to Monday.com board tools. "
                     "Use monday_list_boards to discover boards, "
                     "monday_get_board for details (columns, groups), "
-                    "monday_list_groups to see groups, and "
-                    "monday_create_group to add a new group."
+                    "monday_create_board / monday_archive_board to manage boards, "
+                    "monday_list_groups / monday_create_group for groups, "
+                    "monday_list_workspaces for workspaces, and "
+                    "monday_list_users to resolve people for assignments."
                 ),
                 tools=[
                     "monday_list_boards",
                     "monday_get_board",
+                    "monday_create_board",
+                    "monday_archive_board",
                     "monday_list_groups",
                     "monday_create_group",
+                    "monday_list_workspaces",
+                    "monday_list_users",
                 ],
             ),
         )
@@ -560,17 +881,21 @@ class MondayPlugin(LunaPlugin):
             SkillDef(
                 name="monday-columns",
                 description=(
-                    "Monday.com status and column value management"
+                    "Monday.com column management — statuses, column values, "
+                    "add or remove board columns"
                 ),
                 body=(
                     "You now have access to Monday.com column tools. "
                     "Use monday_set_status to update a status column, "
-                    "and monday_get_column_values to read all column "
-                    "values for an item."
+                    "monday_get_column_values to read an item's values, "
+                    "monday_create_column to add a column to a board, and "
+                    "monday_delete_column to remove one."
                 ),
                 tools=[
                     "monday_set_status",
                     "monday_get_column_values",
+                    "monday_create_column",
+                    "monday_delete_column",
                 ],
             ),
         )
@@ -598,5 +923,54 @@ class MondayPlugin(LunaPlugin):
             ),
         )
 
+        ctx.skill_registry.register(
+            plugin,
+            SkillDef(
+                name="monday-webhooks",
+                description=(
+                    "Monday.com change triggers — subscribe boards to webhook "
+                    "events that fire Luna events on item/column/status changes"
+                ),
+                body=(
+                    "You now have access to Monday.com webhook tools. "
+                    "Use monday_create_webhook to watch a board for changes "
+                    "(item created, column changed, status changed, item deleted, "
+                    "comment posted, date arrived, ...). Incoming events are "
+                    "re-emitted on Luna's event bus as monday.* events "
+                    "(monday.item.created, monday.column.changed, "
+                    "monday.status.changed, monday.item.deleted, ...) which "
+                    "playbooks and schedulers can react to. "
+                    "monday_list_webhooks shows what a board is subscribed to; "
+                    "monday_delete_webhook unsubscribes."
+                ),
+                tools=[
+                    "monday_create_webhook",
+                    "monday_list_webhooks",
+                    "monday_delete_webhook",
+                ],
+            ),
+        )
 
-__all__ = ["MondayPlugin", "VAULT_TOKEN_KEY", "VAULT_ACCOUNT_KEY"]
+        ctx.skill_registry.register(
+            plugin,
+            SkillDef(
+                name="monday-api",
+                description=(
+                    "Raw Monday.com GraphQL — any API operation the dedicated "
+                    "tools don't cover (docs, dashboards, tags, teams, assets, ...)"
+                ),
+                body=(
+                    "You now have raw access to the Monday.com GraphQL API. "
+                    "Use monday_api_query for reads and monday_api_mutate for "
+                    "writes. Pass GraphQL variables as a JSON object; use "
+                    "monday_get_board first when you need column IDs."
+                ),
+                tools=[
+                    "monday_api_query",
+                    "monday_api_mutate",
+                ],
+            ),
+        )
+
+
+__all__ = ["MondayPlugin", "VAULT_TOKEN_KEY", "VAULT_ACCOUNT_KEY", "VAULT_OAUTH_BUNDLE_KEY"]

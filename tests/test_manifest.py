@@ -19,12 +19,13 @@ def test_identity():
 
 def test_tool_count_matches_requires():
     m = _manifest()
-    assert len(m["tools"]) == m["requires"]["tools"] == 17
+    assert len(m["tools"]) == m["requires"]["tools"] == 28
 
 
-def test_declares_oauth_env():
+def test_no_env_required():
+    # No-app OAuth: no client-id/secret env vars, nothing to configure.
     m = _manifest()
-    assert set(m["requires"]["env"]) == {"LUNA_MONDAY_CLIENT_ID", "LUNA_MONDAY_CLIENT_SECRET"}
+    assert "env" not in m["requires"]
 
 
 def test_no_core_imports_in_source():
