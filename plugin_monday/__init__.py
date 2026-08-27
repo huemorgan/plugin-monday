@@ -38,13 +38,39 @@ ENV_KEY = "LUNA_MONDAY_API_KEY"
 ENV_BASE_URL = "LUNA_MONDAY_BASE_URL"
 
 
+def find_webhooks_plugin():
+    """The live plugin-webhooks instance, or None when not installed.
+
+    The loader imports in-tree plugins as ``plugin_webhooks`` but managed
+    (marketplace-installed) ones under a synthetic name
+    (``luna_plugin_plugin_webhooks``), so check both — and fall back to a
+    sys.modules scan in case the naming scheme shifts again.
+    """
+    import sys as _sys
+
+    candidates = ["plugin_webhooks", "luna_plugin_plugin_webhooks"]
+    candidates += [
+        n for n in list(_sys.modules)
+        if n.endswith("plugin_webhooks") and n not in candidates
+    ]
+    for name in candidates:
+        mod = _sys.modules.get(name)
+        state = getattr(mod, "state", None)
+        get = getattr(state, "get_plugin", None)
+        if callable(get):
+            live = get()
+            if live is not None:
+                return live
+    return None
+
+
 class MondayPlugin(LunaPlugin):
     manifest = PluginManifest(
         name="plugin-monday",
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.3.0",
+        version="0.4.0",
         description="Monday.com boards, items, webhooks, and full API access via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
@@ -157,8 +183,18 @@ class MondayPlugin(LunaPlugin):
             )
         return client
 
+    @staticmethod
+    def _webhooks_plugin():
+        return find_webhooks_plugin()
+
     async def _webhook_url(self) -> str:
-        """Public URL monday should deliver webhook events to."""
+        """Public URL monday should deliver webhook events to.
+
+        Minted through plugin-webhooks so deliveries wake a sleeping
+        machine instead of being lost; there is no direct-URL fallback.
+        Sync mode is required — the gateway's queue path can't echo
+        Monday's registration challenge.
+        """
         vault = getattr(self._ctx, "vault", None)
         if vault is None:
             raise RuntimeError("Vault not available")
@@ -168,20 +204,23 @@ class MondayPlugin(LunaPlugin):
             secret = secrets.token_urlsafe(24)
             await vault.store_credential(VAULT_WEBHOOK_SECRET_KEY, secret, kind="metadata")
 
-        base = ""
-        try:
-            raw = (await vault.get_credential(VAULT_OAUTH_BUNDLE_KEY)).value
-            base = (json.loads(raw).get("public_base") or "").rstrip("/")
-        except (KeyError, ValueError):
-            pass
-        if not base:
-            base = (os.environ.get("LUNA_BASE_URL") or "").rstrip("/")
-        if not base:
+        webhooks = self._webhooks_plugin()
+        if webhooks is None:
             raise RuntimeError(
-                "No public base URL known for webhook delivery. Connect via OAuth "
-                "in Settings > Monday.com, or set LUNA_BASE_URL."
+                "Monday.com triggers need the Webhooks plugin. Install "
+                "'plugin-webhooks' from the Marketplace, then try again — "
+                "it gives Monday a stable public URL that wakes this agent."
             )
-        return f"{base}/api/p/plugin-monday/webhook/{secret}"
+        hook = await webhooks.create_hook(
+            "monday-events",
+            target=f"/api/p/plugin-monday/webhook/{secret}",
+            mode="sync",
+            plugin="plugin-monday",
+        )
+        url = hook.get("public_url")
+        if not url:
+            raise RuntimeError("Webhooks plugin returned no public URL for the Monday hook.")
+        return url
 
     # ── tools ─────────────────────────────────────────────────
 
@@ -701,7 +740,10 @@ class MondayPlugin(LunaPlugin):
             ToolDef(
                 name="monday_create_webhook",
                 description=(
-                    "Subscribe to change events on a Monday.com board. Events are "
+                    "Subscribe to change events on a Monday.com board. Requires "
+                    "the Webhooks plugin (plugin-webhooks) — if it is not "
+                    "installed, tell the user to install it from the Marketplace "
+                    "first. Events are "
                     "delivered to Luna and re-emitted on the event bus as monday.* "
                     "(e.g. monday.item.created, monday.column.changed). Common "
                     "event values: create_item, change_column_value, "
@@ -933,6 +975,10 @@ class MondayPlugin(LunaPlugin):
                 ),
                 body=(
                     "You now have access to Monday.com webhook tools. "
+                    "They deliver through the Webhooks plugin (plugin-webhooks), "
+                    "which must be installed — if a webhook tool reports it is "
+                    "missing, ask the user to install plugin-webhooks from the "
+                    "Marketplace, then retry. "
                     "Use monday_create_webhook to watch a board for changes "
                     "(item created, column changed, status changed, item deleted, "
                     "comment posted, date arrived, ...). Incoming events are "

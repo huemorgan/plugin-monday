@@ -65,6 +65,7 @@
       color: var(--text); font-size: 14px; font-family: inherit; margin-bottom: .6rem;
     }
     input[type=password]:focus { outline: none; border-color: var(--violet); }
+    #triggers { margin-top: 1rem; }
   </style>
 </head>
 <body>
@@ -94,6 +95,12 @@
              data-testid="monday-token-input" />
       <button id="token-btn" class="primary" data-testid="monday-token-btn">Connect with token</button>
     </details>
+  </div>
+
+  <div id="triggers" class="card hidden" data-testid="monday-triggers-card">
+    <p class="eyebrow">Triggers from Monday.com</p>
+    <p class="headline"><span id="triggers-dot" class="dot off"></span> <span id="triggers-headline"></span></p>
+    <p class="support" id="triggers-support" style="margin-bottom:0"></p>
   </div>
 
   <script>
@@ -131,7 +138,26 @@
         } else {
           show('disconnected');
         }
+        renderTriggers(s.webhooks_ready === true);
       } catch (e) { showError(e.message); show('disconnected'); }
+    }
+
+    function renderTriggers(ready) {
+      el('triggers').classList.remove('hidden');
+      el('triggers-dot').className = 'dot ' + (ready ? 'on' : 'off');
+      if (ready) {
+        el('triggers-headline').textContent = 'Board changes can trigger this agent';
+        el('triggers-support').textContent =
+          'Ask Luna to watch a board (item created, status changed, and more). ' +
+          'Each change arrives as a monday.* event you can pick as a playbook trigger — ' +
+          'delivered through the Webhooks plugin, so it reaches the agent even when asleep.';
+      } else {
+        el('triggers-headline').textContent = 'Needs the Webhooks plugin';
+        el('triggers-support').textContent =
+          'Install the Webhooks plugin from the Marketplace to let Monday.com trigger ' +
+          'this agent. It provides the public URL board changes are delivered to. ' +
+          'Until then, webhook tools and playbook triggers from Monday are unavailable.';
+      }
     }
     function busy(btn, on, label) { btn.disabled = on; btn.innerHTML = on ? '<span class="spinner"></span>' + label : btn.dataset.label; }
 

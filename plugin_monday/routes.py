@@ -75,6 +75,15 @@ class _StatusResp(BaseModel):
     method: str | None = None
     account_name: str | None = None
     board_count: int | None = None
+    # True when plugin-webhooks is installed — Monday triggers deliver
+    # through it and are unavailable without it.
+    webhooks_ready: bool = False
+
+
+def _webhooks_ready() -> bool:
+    from . import find_webhooks_plugin
+
+    return find_webhooks_plugin() is not None
 
 
 class _TokenReq(BaseModel):
@@ -287,7 +296,7 @@ def register_routes(app, ctx):
                 await _vault().get_credential(VAULT_TOKEN_KEY)
                 method = "token"
             except KeyError:
-                return _StatusResp(connected=False)
+                return _StatusResp(connected=False, webhooks_ready=_webhooks_ready())
 
         client = get_client()
         account_name = None
@@ -306,6 +315,7 @@ def register_routes(app, ctx):
             method=method,
             account_name=account_name,
             board_count=board_count,
+            webhooks_ready=_webhooks_ready(),
         )
 
     @router.post("/webhook/{secret}")

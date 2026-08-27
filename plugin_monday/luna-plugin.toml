@@ -1,6 +1,6 @@
 name = "plugin-monday"
 shown_name = "Monday.com"
-version = "0.3.0"
+version = "0.4.0"
 description = "Monday.com boards, items, webhooks, and full API access via GraphQL."
 entry = "plugin_monday"
 sdk_version = "0"
