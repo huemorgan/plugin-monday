@@ -336,14 +336,27 @@ def register_routes(app, ctx):
         if "challenge" in payload:
             return {"challenge": payload["challenge"]}
 
-        event_type = payload.get("event", {}).get("type", "")
+        event = payload.get("event", {})
+        event_type = event.get("type", "") if isinstance(event, dict) else ""
         bus_event = WEBHOOK_EVENT_MAP.get(event_type)
 
+        # Flatten common identifiers to the top level so playbook trigger
+        # filters can be written as {"boardId": 123} — the filter matcher
+        # does flat dot-path equality against this payload. The raw Monday
+        # event stays nested under "event".
+        bus_payload = dict(payload)
+        if isinstance(event, dict):
+            for key in ("boardId", "pulseId", "groupId", "columnId", "userId", "type"):
+                if key in event and key not in bus_payload:
+                    bus_payload[key] = event[key]
+            if "pulseId" in event:
+                bus_payload.setdefault("itemId", event["pulseId"])
+
         if bus_event:
-            await ctx.events.emit(bus_event, payload)
+            await ctx.events.emit(bus_event, bus_payload)
             log.info("monday webhook: %s", bus_event)
         else:
-            await ctx.events.emit("monday.event", payload)
+            await ctx.events.emit("monday.event", bus_payload)
             log.info("monday webhook: unmapped type %s", event_type)
 
         return {"ok": True}

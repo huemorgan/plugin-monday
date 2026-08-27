@@ -41,6 +41,17 @@ def _install_luna_sdk_stub() -> None:
         tools: list = field(default_factory=list)
 
     @dataclass
+    class TriggerInfo:
+        slug: str
+        source: str
+        app: str
+        label: str
+        event_pattern: str
+        config_schema: dict = field(default_factory=dict)
+        payload_example: dict | None = None
+        description: str = ""
+
+    @dataclass
     class CredentialSlot:
         slug: str
         credential_name: str
@@ -86,6 +97,7 @@ def _install_luna_sdk_stub() -> None:
     mod.ToolDef = ToolDef
     mod.SettingsTab = SettingsTab
     mod.SkillDef = SkillDef
+    mod.TriggerInfo = TriggerInfo
     mod.CredentialSlot = CredentialSlot
     mod.PluginManifest = PluginManifest
     mod.PluginContext = PluginContext

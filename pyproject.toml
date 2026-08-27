@@ -1,6 +1,6 @@
 [project]
 name = "plugin-monday"
-version = "0.4.1"
+version = "0.5.0"
 description = "Monday.com boards, items, webhooks, and full API access for Luna. Built on luna_sdk v0."
 readme = "README.md"
 license = { text = "MIT" }

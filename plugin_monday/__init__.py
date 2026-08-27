@@ -70,7 +70,7 @@ class MondayPlugin(LunaPlugin):
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.4.1",
+        version="0.5.0",
         description="Monday.com boards, items, webhooks, and full API access via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
@@ -117,6 +117,15 @@ class MondayPlugin(LunaPlugin):
 
         self._register_tools(ctx)
         self._register_skills(ctx)
+        # Advertise monday.* events for playbook trigger discovery. Older
+        # cores lack trigger_sources / TriggerInfo — degrade silently.
+        if getattr(ctx, "trigger_sources", None) is not None:
+            try:
+                from .triggers import MondayTriggerSource
+
+                ctx.trigger_sources.register(self.manifest.name, MondayTriggerSource())
+            except Exception as exc:  # noqa: BLE001
+                log.warning("plugin-monday: trigger registration failed: %s", exc)
         log.info(
             "plugin-monday loaded (tools=28, connected=%s, transport=%s)",
             get_client() is not None,
@@ -170,6 +179,8 @@ class MondayPlugin(LunaPlugin):
         return (os.environ.get("MONDAY_BASE_URL") or "").strip() or None
 
     async def on_unload(self) -> None:
+        if self._ctx is not None and getattr(self._ctx, "trigger_sources", None) is not None:
+            self._ctx.trigger_sources.unregister_plugin(self.manifest.name)
         client = get_client()
         if client is not None:
             await client.close()
@@ -985,7 +996,9 @@ class MondayPlugin(LunaPlugin):
                     "re-emitted on Luna's event bus as monday.* events "
                     "(monday.item.created, monday.column.changed, "
                     "monday.status.changed, monday.item.deleted, ...) which "
-                    "playbooks and schedulers can react to. "
+                    "playbooks and schedulers can react to. In a playbook "
+                    'trigger, filter by board with {"boardId": <board id>} — '
+                    "boardId, itemId, and type are top-level payload keys. "
                     "monday_list_webhooks shows what a board is subscribed to; "
                     "monday_delete_webhook unsubscribes."
                 ),
