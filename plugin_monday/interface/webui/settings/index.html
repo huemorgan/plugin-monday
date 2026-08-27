@@ -148,9 +148,11 @@
       if (ready) {
         el('triggers-headline').textContent = 'Board changes can trigger this agent';
         el('triggers-support').textContent =
-          'Ask Luna to watch a board (item created, status changed, and more). ' +
-          'Each change arrives as a monday.* event you can pick as a playbook trigger — ' +
-          'delivered through the Webhooks plugin, so it reaches the agent even when asleep.';
+          'Ask Luna to watch a board for any event Monday.com can send — items ' +
+          'created, changed, moved, or deleted, status changes, subitems, updates, ' +
+          'date arrivals. Each one arrives as a monday.* event you can pick as a ' +
+          'playbook trigger — delivered through the Webhooks plugin, so it reaches ' +
+          'the agent even when asleep.';
       } else {
         el('triggers-headline').textContent = 'Needs the Webhooks plugin';
         el('triggers-support').textContent =

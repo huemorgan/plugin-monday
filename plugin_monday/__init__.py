@@ -70,7 +70,7 @@ class MondayPlugin(LunaPlugin):
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.4.0",
+        version="0.4.1",
         description="Monday.com boards, items, webhooks, and full API access via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
