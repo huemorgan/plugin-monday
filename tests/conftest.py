@@ -15,6 +15,12 @@ def _install_luna_sdk_stub() -> None:
     mod = types.ModuleType("luna_sdk")
 
     @dataclass
+    class ProbeDef:
+        kind: str = "auth"
+        handler: Any = None
+        args: dict | None = None
+
+    @dataclass
     class ToolDef:
         name: str
         description: str = ""
@@ -24,6 +30,7 @@ def _install_luna_sdk_stub() -> None:
         timeout_seconds: int | None = None
         sensitive_args: list = field(default_factory=list)
         skill_gated: bool = False
+        probe: Any = None
 
     @dataclass
     class SettingsTab:
@@ -95,6 +102,7 @@ def _install_luna_sdk_stub() -> None:
 
     mod.get_current_user = get_current_user
     mod.ToolDef = ToolDef
+    mod.ProbeDef = ProbeDef
     mod.SettingsTab = SettingsTab
     mod.SkillDef = SkillDef
     mod.TriggerInfo = TriggerInfo

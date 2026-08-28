@@ -9,11 +9,14 @@ monday-webhooks, or monday-api skills to gain access.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import secrets
 from typing import Any
+
+import httpx
 
 from luna_sdk import (
     CredentialSlot,
@@ -25,7 +28,12 @@ from luna_sdk import (
     ToolDef,
 )
 
-from .client import MondayClient, client_from_bundle
+try:  # luna core ≥ 0.84.002; older cores have no ToolDef.probe field
+    from luna_sdk import ProbeDef
+except ImportError:  # pragma: no cover
+    ProbeDef = None
+
+from .client import MondayAPIError, MondayClient, client_from_bundle
 from .state import get_client, set_client
 
 log = logging.getLogger("plugin-monday")
@@ -36,6 +44,42 @@ VAULT_OAUTH_BUNDLE_KEY = "plugin_monday.oauth2"
 VAULT_WEBHOOK_SECRET_KEY = "plugin_monday.webhook_secret"
 ENV_KEY = "LUNA_MONDAY_API_KEY"
 ENV_BASE_URL = "LUNA_MONDAY_BASE_URL"
+
+PROBE_TIMEOUT_S = 10.0
+
+
+def _classify_http_error(exc: httpx.HTTPStatusError) -> dict[str, Any]:
+    status = exc.response.status_code
+    snippet = " ".join((exc.response.text or "").split())[:160]
+    if "token" in str(exc.request.url):
+        # DCR token endpoint refused the refresh — the OAuth grant itself is dead.
+        return {
+            "failure_class": "credential_dead",
+            "detail": f"OAuth refresh failed (HTTP {status}) — reconnect in Settings > Monday.com.",
+        }
+    if status == 401:
+        return {"failure_class": "credential_dead",
+                "detail": f"Monday rejected the token (HTTP 401). {snippet}".strip()}
+    if status in (402, 403):
+        return {"failure_class": "permission",
+                "detail": f"Monday refused access (HTTP {status}). {snippet}".strip()}
+    if status == 429:
+        return {"failure_class": "rate_limited",
+                "detail": "Monday rate limit hit (HTTP 429)."}
+    return {"failure_class": "unknown",
+            "detail": f"Monday returned HTTP {status}. {snippet}".strip()}
+
+
+def _classify_api_error(exc: MondayAPIError) -> dict[str, Any]:
+    msg = str(exc)
+    low = msg.lower()
+    if any(s in low for s in ("unauthorized", "not authenticated", "invalid token", "authentication")):
+        return {"failure_class": "credential_dead", "detail": msg[:200]}
+    if any(s in low for s in ("permission", "scope", "forbidden", "restricted")):
+        return {"failure_class": "permission", "detail": msg[:200]}
+    if any(s in low for s in ("complexity", "rate limit", "budget", "minute limit")):
+        return {"failure_class": "rate_limited", "detail": msg[:200]}
+    return {"failure_class": "unknown", "detail": msg[:200]}
 
 
 def find_webhooks_plugin():
@@ -70,7 +114,7 @@ class MondayPlugin(LunaPlugin):
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.5.0",
+        version="0.6.0",
         description="Monday.com boards, items, webhooks, and full API access via GraphQL.",
         category="connectors",
         depends_on=["plugin-vault"],
@@ -194,6 +238,43 @@ class MondayPlugin(LunaPlugin):
             )
         return client
 
+    async def probe_auth(self) -> dict[str, Any]:
+        """Shared credential probe for every tool: one cheap `me` query.
+
+        Always returns a result dict, never raises. Accepted side effect: a
+        stale OAuth bundle may auto-refresh during the probe.
+        """
+        client = get_client()
+        if client is None:
+            return {
+                "ok": False,
+                "failure_class": "credential_dead",
+                "detail": "Monday.com is not connected — connect in Settings > Monday.com.",
+            }
+        try:
+            data = await asyncio.wait_for(
+                client.api("query { me { id name } }"), timeout=PROBE_TIMEOUT_S,
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            return {"ok": False, "failure_class": "unknown",
+                    "detail": f"Monday.com did not answer within {PROBE_TIMEOUT_S:.0f}s."}
+        except MondayAPIError as exc:
+            return {"ok": False, **_classify_api_error(exc)}
+        except httpx.HTTPStatusError as exc:
+            return {"ok": False, **_classify_http_error(exc)}
+        except httpx.HTTPError as exc:
+            return {"ok": False, "failure_class": "unknown",
+                    "detail": f"Network error reaching Monday.com: {exc}"[:200]}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "failure_class": "unknown", "detail": str(exc)[:200]}
+        me = (data or {}).get("me") or {}
+        if not me.get("id"):
+            return {"ok": False, "failure_class": "unknown",
+                    "detail": "Monday answered but returned no identity."}
+        who = me.get("name") or me["id"]
+        return {"ok": True, "failure_class": None,
+                "detail": f"Authenticated to Monday.com as {who}."}
+
     @staticmethod
     def _webhooks_plugin():
         return find_webhooks_plugin()
@@ -237,8 +318,12 @@ class MondayPlugin(LunaPlugin):
 
     def _register_tools(self, ctx: PluginContext) -> None:
         plugin = self.manifest.name
+        # One credential backs all 28 tools, so they share one auth probe.
+        probe = ProbeDef(kind="auth", handler=self.probe_auth) if ProbeDef else None
 
         def _reg(tool_def: ToolDef, handler) -> None:
+            if probe is not None:
+                tool_def.probe = probe
             ctx.tool_registry.register(plugin, tool_def, handler, skill_gated=True)
 
         # --- boards ---
