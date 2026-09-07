@@ -118,7 +118,7 @@ def test_probe_attached_to_all_tools(plugin):
         tool_registry = _Registry()
 
     plugin._register_tools(_Ctx())
-    assert len(registered) == 28
+    assert len(registered) == 29
     for td in registered:
         assert td.probe is not None
         assert td.probe.kind == "auth"

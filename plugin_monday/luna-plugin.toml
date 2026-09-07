@@ -1,11 +1,11 @@
 name = "plugin-monday"
 shown_name = "Monday.com"
-version = "0.6.0"
-description = "Monday.com boards, items, webhooks, and full API access via GraphQL."
+version = "0.7.0"
+description = "Monday.com boards, items, webhooks, full API access via GraphQL — and Luna listed as an agent inside monday."
 entry = "plugin_monday"
 sdk_version = "0"
 license = "MIT"
-tags = ["connector", "monday", "project-management", "oauth", "webhooks"]
+tags = ["connector", "monday", "project-management", "oauth", "webhooks", "agent"]
 readme = """
 # plugin-monday
 
@@ -22,11 +22,15 @@ as a fallback.
 Board webhooks (item created, column changed, status changed, ...) are
 re-emitted on Luna's event bus as `monday.*` events for playbooks to react to.
 
+**Luna inside monday.com**: one click in Settings lists Luna as an agent in
+your monday account — chat with it from monday, @mention it in updates, or
+assign it items. Replies stream back into monday.
+
 Source: https://github.com/huemorgan/plugin-monday
 """
 
 [requires]
-tools = 28
+tools = 29
 depends_on = ["plugin-vault"]
 
 [[tools]]
@@ -182,6 +186,12 @@ risk_level = "low"
 [[tools]]
 name = "monday_delete_webhook"
 description = "Delete a webhook subscription."
+policy = "ask"
+risk_level = "medium"
+
+[[tools]]
+name = "monday_agent_grant_board_access"
+description = "Give the Luna agent listed inside monday.com access to a board or doc."
 policy = "ask"
 risk_level = "medium"
 

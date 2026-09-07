@@ -19,7 +19,7 @@ def test_identity():
 
 def test_tool_count_matches_requires():
     m = _manifest()
-    assert len(m["tools"]) == m["requires"]["tools"] == 28
+    assert len(m["tools"]) == m["requires"]["tools"] == 29
 
 
 def test_no_env_required():

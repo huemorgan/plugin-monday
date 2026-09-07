@@ -33,8 +33,9 @@ try:  # luna core ≥ 0.84.002; older cores have no ToolDef.probe field
 except ImportError:  # pragma: no cover
     ProbeDef = None
 
+from . import agent as agent_mod
 from .client import MondayAPIError, MondayClient, client_from_bundle
-from .state import get_client, set_client
+from .state import get_client, set_client, set_plugin
 
 log = logging.getLogger("plugin-monday")
 
@@ -114,8 +115,8 @@ class MondayPlugin(LunaPlugin):
         shown_name="Monday.com",
         icon="kanban",
         image="assets/icon.png",
-        version="0.6.0",
-        description="Monday.com boards, items, webhooks, and full API access via GraphQL.",
+        version="0.7.0",
+        description="Monday.com boards, items, webhooks, full API access via GraphQL — and Luna listed as an agent inside monday.",
         category="connectors",
         depends_on=["plugin-vault"],
         routes_module="routes",
@@ -148,6 +149,7 @@ class MondayPlugin(LunaPlugin):
     async def on_load(self, ctx: PluginContext) -> None:
         self._ctx = ctx
         set_client(None)
+        set_plugin(self)
 
         # Auth precedence: OAuth bundle (the no-app popup flow) → vault token
         # (pasted personal token) → env (gateway token in proxy mode).
@@ -171,7 +173,7 @@ class MondayPlugin(LunaPlugin):
             except Exception as exc:  # noqa: BLE001
                 log.warning("plugin-monday: trigger registration failed: %s", exc)
         log.info(
-            "plugin-monday loaded (tools=28, connected=%s, transport=%s)",
+            "plugin-monday loaded (tools=29, connected=%s, transport=%s)",
             get_client() is not None,
             getattr(get_client(), "transport", None),
         )
@@ -229,6 +231,7 @@ class MondayPlugin(LunaPlugin):
         if client is not None:
             await client.close()
             set_client(None)
+        set_plugin(None)
 
     def _get_client(self) -> MondayClient:
         client = get_client()
@@ -314,11 +317,57 @@ class MondayPlugin(LunaPlugin):
             raise RuntimeError("Webhooks plugin returned no public URL for the Monday hook.")
         return url
 
+    async def agent_callback_url(self) -> str:
+        """Stable public URL monday calls when someone chats with, mentions,
+        or assigns the Luna agent. Minted through plugin-webhooks (sync mode
+        relays the SSE reply body) — never the machine's own ephemeral host.
+        """
+        vault = getattr(self._ctx, "vault", None)
+        if vault is None:
+            raise RuntimeError("Vault not available")
+        try:
+            secret = (await vault.get_credential(agent_mod.VAULT_AGENT_CALLBACK_SECRET_KEY)).value
+        except KeyError:
+            secret = agent_mod.new_callback_secret()
+            await vault.store_credential(
+                agent_mod.VAULT_AGENT_CALLBACK_SECRET_KEY, secret, kind="metadata",
+            )
+        webhooks = self._webhooks_plugin()
+        if webhooks is None:
+            raise RuntimeError(
+                "Listing Luna inside monday.com needs the Webhooks plugin. Install "
+                "'plugin-webhooks' from the Marketplace, then try again — it gives "
+                "monday a stable public URL that wakes this agent."
+            )
+        hook = await webhooks.create_hook(
+            agent_mod.HOOK_NAME,
+            target=f"/api/p/plugin-monday/agent/{secret}",
+            mode="sync",
+            plugin="plugin-monday",
+        )
+        url = hook.get("public_url")
+        if not url:
+            raise RuntimeError("Webhooks plugin returned no public URL for the agent hook.")
+        return url
+
+    async def _agent_bundle(self) -> dict[str, Any] | None:
+        vault = getattr(self._ctx, "vault", None)
+        if vault is None:
+            return None
+        try:
+            raw = (await vault.get_credential(agent_mod.VAULT_AGENT_BUNDLE_KEY)).value
+            return json.loads(raw)
+        except KeyError:
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("plugin-monday: agent bundle read failed: %s", exc)
+            return None
+
     # ── tools ─────────────────────────────────────────────────
 
     def _register_tools(self, ctx: PluginContext) -> None:
         plugin = self.manifest.name
-        # One credential backs all 28 tools, so they share one auth probe.
+        # One credential backs all 29 tools, so they share one auth probe.
         probe = ProbeDef(kind="auth", handler=self.probe_auth) if ProbeDef else None
 
         def _reg(tool_def: ToolDef, handler) -> None:
@@ -897,6 +946,60 @@ class MondayPlugin(LunaPlugin):
             _delete_webhook,
         )
 
+        # --- external agent (Luna listed inside monday) ---
+
+        async def _agent_grant_board_access(
+            board_id: int, permission: str = "READ_WRITE", scope: str = "BOARD",
+        ) -> dict[str, Any]:
+            bundle = await self._agent_bundle()
+            if not bundle or not bundle.get("agent_id"):
+                raise RuntimeError(
+                    "Luna is not listed as an agent in monday.com yet. Ask the owner "
+                    "to click 'Add to monday.com' in Settings > Monday.com first."
+                )
+            perm = (permission or "READ_WRITE").upper()
+            if perm not in ("READ", "READ_WRITE"):
+                raise RuntimeError("permission must be READ or READ_WRITE")
+            scope_type = (scope or "BOARD").upper()
+            if scope_type not in ("BOARD", "DOC"):
+                raise RuntimeError("scope must be BOARD or DOC")
+            res = await self._get_client().add_agent_resource_access(
+                bundle["agent_id"], board_id, scope_type=scope_type, permission_type=perm,
+            )
+            return {
+                "granted": bool(res.get("success", True)),
+                "agent_id": bundle["agent_id"],
+                "resource_id": board_id,
+                "scope": scope_type,
+                "permission": perm,
+            }
+
+        _reg(
+            ToolDef(
+                name="monday_agent_grant_board_access",
+                description=(
+                    "Give the Luna agent listed inside monday.com access to a board "
+                    "(or doc). monday agents do not inherit the connecting user's "
+                    "access — until a board is granted, replies posted as the agent "
+                    "on that board fail (Luna then falls back to posting as the "
+                    "connected user). Requires the owner to have clicked 'Add to "
+                    "monday.com' in Settings > Monday.com."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "board_id": {"type": "integer", "description": "Board (or doc) ID to grant."},
+                        "permission": {"type": "string", "description": "READ or READ_WRITE (default READ_WRITE)."},
+                        "scope": {"type": "string", "description": "BOARD (default) or DOC."},
+                    },
+                    "required": ["board_id"],
+                },
+                policy="ask",
+                risk_level="medium",
+            ),
+            _agent_grant_board_access,
+        )
+
         # --- raw API (anything the dedicated tools don't cover) ---
 
         async def _api_query(query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1098,6 +1201,28 @@ class MondayPlugin(LunaPlugin):
         ctx.skill_registry.register(
             plugin,
             SkillDef(
+                name="monday-agent",
+                description=(
+                    "Luna as an agent inside monday.com — grant the listed agent "
+                    "access to boards so it can reply in monday under its own name"
+                ),
+                body=(
+                    "Luna can be listed as a custom agent inside monday.com (the "
+                    "owner adds it from Settings > Monday.com). monday users then "
+                    "chat with it, @mention it in updates, or assign items to it; "
+                    "each arrives here as a turn and the reply goes back into "
+                    "monday. The agent identity starts with NO board access: use "
+                    "monday_agent_grant_board_access(board_id) for every board it "
+                    "should work on, or its replies post as the connected user "
+                    "instead of as the agent."
+                ),
+                tools=["monday_agent_grant_board_access"],
+            ),
+        )
+
+        ctx.skill_registry.register(
+            plugin,
+            SkillDef(
                 name="monday-api",
                 description=(
                     "Raw Monday.com GraphQL — any API operation the dedicated "
@@ -1117,4 +1242,10 @@ class MondayPlugin(LunaPlugin):
         )
 
 
-__all__ = ["MondayPlugin", "VAULT_TOKEN_KEY", "VAULT_ACCOUNT_KEY", "VAULT_OAUTH_BUNDLE_KEY"]
+__all__ = [
+    "MondayPlugin",
+    "VAULT_TOKEN_KEY",
+    "VAULT_ACCOUNT_KEY",
+    "VAULT_OAUTH_BUNDLE_KEY",
+    "VAULT_WEBHOOK_SECRET_KEY",
+]

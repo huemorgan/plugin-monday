@@ -1,6 +1,7 @@
 """plugin-monday API routes — no-app OAuth (DCR + PKCE), token connect, status,
 disconnect, webhook receiver, and the iframe settings UI."""
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -13,9 +14,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Request, Depends
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from . import agent as agent_mod
 from .state import get_client, set_client
 
 
@@ -78,6 +80,12 @@ class _StatusResp(BaseModel):
     # True when plugin-webhooks is installed — Monday triggers deliver
     # through it and are unavailable without it.
     webhooks_ready: bool = False
+    # Luna listed as a custom agent inside monday (external agent API).
+    agent: dict | None = None
+
+
+class _AgentConnectReq(BaseModel):
+    name: str | None = None
 
 
 def _webhooks_ready() -> bool:
@@ -88,6 +96,48 @@ def _webhooks_ready() -> bool:
 
 class _TokenReq(BaseModel):
     token: str
+
+
+def _agent_error_text(exc: Exception, client) -> str:
+    """monday's reason, plus the one steer that matters: the OAuth passthrough
+    can't reach the pre-release agent API — a personal API token can."""
+    msg = str(exc) or exc.__class__.__name__
+    low = msg.lower()
+    if getattr(client, "transport", "") == "oauth" and (
+        "cannot query field" in low or "unknown" in low or "not found" in low
+        or "version" in low or "isError" in msg
+    ):
+        return (
+            "monday.com's OAuth connection can't reach the external-agent API yet. "
+            "Disconnect and connect again with a personal API token "
+            "(monday.com → avatar → Developers → My access tokens), then retry. "
+            f"({msg[:200]})"
+        )
+    return msg[:400]
+
+
+class _AgentIdentityClient:
+    """MondayClient bound to the agent's own token: every call carries the
+    pre-release API version and closes its transport after use."""
+
+    def __init__(self, client, api_version: str) -> None:
+        self._client = client
+        self._version = api_version
+
+    async def create_update(self, item_id: int, body: str, *, parent_id=None) -> dict:
+        try:
+            if parent_id:
+                q = "mutation($item:ID!, $body:String!, $parent:ID){create_update(item_id:$item, body:$body, parent_id:$parent){id}}"
+                data = await self._client._gql(
+                    q, {"item": item_id, "body": body, "parent": str(parent_id)},
+                    api_version=self._version,
+                )
+            else:
+                q = "mutation($item:ID!, $body:String!){create_update(item_id:$item, body:$body){id}}"
+                data = await self._client._gql(q, {"item": item_id, "body": body}, api_version=self._version)
+            return data.get("create_update", {}) or {}
+        finally:
+            await self._client.close()
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -316,6 +366,7 @@ def register_routes(app, ctx):
             account_name=account_name,
             board_count=board_count,
             webhooks_ready=_webhooks_ready(),
+            agent=_agent_public(await _vault_json(agent_mod.VAULT_AGENT_BUNDLE_KEY)),
         )
 
     @router.post("/webhook/{secret}")
@@ -360,6 +411,248 @@ def register_routes(app, ctx):
             log.info("monday webhook: unmapped type %s", event_type)
 
         return {"ok": True}
+
+
+    # --- External agent: Luna listed inside monday.com ---
+
+    def _agent_public(bundle: dict | None) -> dict | None:
+        """Bundle minus secrets — what the settings page sees."""
+        if not bundle:
+            return None
+        return {
+            "agent_id": bundle.get("agent_id"),
+            "name": bundle.get("name"),
+            "callback_url": bundle.get("callback_url"),
+            "active": bool(bundle.get("active")),
+            "created_at": bundle.get("created_at"),
+        }
+
+    def _plugin():
+        from .state import get_plugin
+
+        return get_plugin()
+
+    async def _agent_client(bundle: dict | None):
+        """A client acting AS the monday agent (its own api_token), or None."""
+        from .client import AGENT_API_VERSION, MondayClient
+
+        token = (bundle or {}).get("api_token")
+        if not token:
+            return None
+        return _AgentIdentityClient(MondayClient(token), AGENT_API_VERSION)
+
+    @router.post("/agent/connect")
+    async def agent_connect(body: _AgentConnectReq, user=Depends(get_current_user)):
+        """Create Luna as a custom agent in the connected monday account:
+        mint the stable callback URL, connect_external_agent_sync (~25 s),
+        activate, store the once-only secrets."""
+        client = get_client()
+        if client is None:
+            raise HTTPException(409, "Connect Monday.com first")
+        vault = _vault()
+        existing = await _vault_json(agent_mod.VAULT_AGENT_BUNDLE_KEY)
+        if existing and existing.get("agent_id"):
+            raise HTTPException(409, "Already listed in monday.com — remove it first to recreate")
+
+        plugin = _plugin()
+        if plugin is None:
+            raise HTTPException(503, "plugin not loaded")
+        try:
+            callback_url = await plugin.agent_callback_url()
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc))
+
+        name = (body.name or "").strip() or agent_mod.DEFAULT_AGENT_NAME
+        try:
+            created = await client.connect_external_agent(name, callback_url)
+        except Exception as exc:  # noqa: BLE001 — surface monday's reason verbatim
+            raise HTTPException(502, _agent_error_text(exc, client))
+        agent_id = created.get("agent_id")
+        if not agent_id:
+            raise HTTPException(502, "monday.com returned no agent id")
+
+        bundle = {
+            "agent_id": str(agent_id),
+            "name": name,
+            "callback_url": callback_url,
+            "signing_secret": created.get("signing_secret") or "",
+            "api_token": created.get("api_token") or "",
+            "instructions": created.get("instructions") or "",
+            "active": False,
+            "created_at": time.time(),
+        }
+        # Persist BEFORE activating: the secrets are shown once and a failed
+        # activate must not lose them.
+        await vault.store_credential(
+            agent_mod.VAULT_AGENT_BUNDLE_KEY, json.dumps(bundle), kind="oauth",
+        )
+        activate_error = None
+        try:
+            res = await client.activate_agent(agent_id)
+            bundle["active"] = bool(res.get("success", True))
+        except Exception as exc:  # noqa: BLE001
+            activate_error = _agent_error_text(exc, client)
+            log.warning("plugin-monday: activate_agent failed: %s", exc)
+        await vault.store_credential(
+            agent_mod.VAULT_AGENT_BUNDLE_KEY, json.dumps(bundle), kind="oauth",
+        )
+        await ctx.events.emit("monday.agent.connected", {
+            "agent_id": bundle["agent_id"], "name": name, "callback_url": callback_url,
+        })
+        out = {"agent": _agent_public(bundle)}
+        if activate_error:
+            out["warning"] = f"Created but not activated: {activate_error}"
+        return out
+
+    @router.post("/agent/disconnect")
+    async def agent_disconnect(user=Depends(get_current_user)):
+        vault = _vault()
+        bundle = await _vault_json(agent_mod.VAULT_AGENT_BUNDLE_KEY)
+        client = get_client()
+        removed_remote = False
+        if bundle and bundle.get("agent_id") and client is not None:
+            try:
+                res = await client.disconnect_external_agent(bundle["agent_id"])
+                removed_remote = bool(res.get("success", True))
+            except Exception as exc:  # noqa: BLE001 — local cleanup still proceeds
+                log.warning("plugin-monday: disconnect_external_agent failed: %s", exc)
+        try:
+            await vault.delete_credential(agent_mod.VAULT_AGENT_BUNDLE_KEY)
+        except KeyError:
+            pass
+        return {"agent": None, "removed_in_monday": removed_remote}
+
+    @router.post("/agent/{secret}")
+    async def agent_callback(request: Request, secret: str):
+        """monday → Luna. Signed ``agent_triggered`` POST; chat answers in-body
+        (SSE), mention/assigned ack then reply as an update in the background."""
+        raw = await request.body()
+        bundle = await _vault_json(agent_mod.VAULT_AGENT_BUNDLE_KEY)
+        if not bundle:
+            raise HTTPException(404, "no agent configured")
+        expected = None
+        try:
+            expected = (await _vault().get_credential(
+                agent_mod.VAULT_AGENT_CALLBACK_SECRET_KEY
+            )).value
+        except (KeyError, HTTPException):
+            pass
+        if expected and not secrets.compare_digest(secret, expected):
+            raise HTTPException(403, "unknown callback secret")
+        ts = request.headers.get("x-monday-timestamp", "")
+        sig = request.headers.get("x-monday-signature", "")
+        if not agent_mod.verify_signature(bundle.get("signing_secret", ""), ts, raw, sig):
+            raise HTTPException(403, "bad signature")
+        if not agent_mod.timestamp_fresh(ts):
+            raise HTTPException(403, "stale timestamp")
+
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            raise HTTPException(400, "invalid JSON")
+        if body.get("event") != "agent_triggered":
+            return {"message": ""}
+
+        agent = getattr(ctx, "agent", None)
+        if agent is None:
+            raise HTTPException(503, "agent not ready")
+        trigger = (body.get("triggerType") or "unknown").lower()
+        payload = body.get("payload") or {}
+        prompt = agent_mod.build_prompt(body)
+        log.info("monday agent trigger: %s item=%s", trigger, payload.get("itemId"))
+
+        if trigger == "chat":
+            if body.get("stream") is False:
+                text = await _run_turn(agent, prompt, timeout=agent_mod.CHAT_TURN_TIMEOUT_S)
+                return {"message": text}
+            return StreamingResponse(
+                _stream_turn(agent, prompt),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+            )
+
+        # mention / assigned / unknown: ack now, reply through GraphQL later.
+        key = agent_mod.dedupe_key(dict(request.headers), body)
+        if not _recent.seen(key):
+            asyncio.create_task(_reply_later(agent, prompt, payload, bundle))
+        return StreamingResponse(
+            iter([agent_mod.SSE_DONE]), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    async def _run_turn(agent, prompt: str, *, timeout: float, on_event=None) -> str:
+        kwargs = {"memory_read": True, "memory_write": True, "timeout_s": timeout}
+        if on_event is not None:
+            kwargs["event_stream_handler"] = on_event
+        try:
+            result, _usage = await agent.run_turn(prompt, **kwargs)
+        except TypeError as exc:
+            # Older cores without event_stream_handler/timeout_s kwargs.
+            if "unexpected keyword" not in str(exc):
+                raise
+            result, _usage = await agent.run_turn(prompt, memory_read=True, memory_write=True)
+        return agent_mod.turn_text(result)
+
+    async def _stream_turn(agent, prompt: str):
+        """SSE body: text deltas as the model produces them, keepalives while
+        tools run, the final text if nothing streamed, then [DONE]."""
+        queue: asyncio.Queue = asyncio.Queue()
+        streamed = {"chars": 0}
+
+        async def on_event(_ctx, events):
+            async for ev in events:
+                piece = agent_mod.delta_text(ev)
+                if piece:
+                    streamed["chars"] += len(piece)
+                    await queue.put(piece)
+
+        async def run():
+            try:
+                return await _run_turn(
+                    agent, prompt, timeout=agent_mod.CHAT_TURN_TIMEOUT_S, on_event=on_event,
+                )
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(run())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=agent_mod.SSE_KEEPALIVE_S)
+                except asyncio.TimeoutError:
+                    yield agent_mod.SSE_KEEPALIVE
+                    continue
+                if item is None:
+                    break
+                yield agent_mod.sse_text(item)
+            try:
+                final = await task
+            except Exception as exc:  # noqa: BLE001
+                log.exception("monday agent chat turn failed")
+                final = "" if streamed["chars"] else f"Sorry — I hit an error: {exc}"[:500]
+            if not streamed["chars"]:
+                yield agent_mod.sse_text(final or "I couldn't produce a reply this time.")
+            yield agent_mod.SSE_DONE
+        finally:
+            if not task.done():
+                task.cancel()
+
+    async def _reply_later(agent, prompt: str, payload: dict, bundle: dict) -> None:
+        try:
+            text = await _run_turn(agent, prompt, timeout=agent_mod.BACKGROUND_TURN_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            log.exception("monday agent background turn failed")
+            return
+        if not text:
+            log.info("monday agent: turn produced no text, nothing posted")
+            return
+        res = await agent_mod.post_reply(
+            text=text, payload=payload,
+            agent_client=await _agent_client(bundle), owner_client=get_client(),
+        )
+        log.info("monday agent reply: %s", res)
+
+    _recent = agent_mod.RecentKeys()
 
     # --- Settings UI (served as a themed iframe by the host) ---
 

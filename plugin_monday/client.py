@@ -33,6 +33,11 @@ MCP_TOKEN_URL = f"{MCP_BASE}/token"
 
 _MUTATION_RE = re.compile(r"^\s*mutation\b")
 
+# External agents are a pre-release feature: every call needs API-Version: dev,
+# and connect_external_agent_sync blocks ~25 s (monday asks for ≥40 s timeouts).
+AGENT_API_VERSION = "dev"
+AGENT_CONNECT_TIMEOUT_S = 60.0
+
 # Board events monday accepts in the create_webhook mutation.
 WEBHOOK_EVENTS = [
     "create_item", "change_name", "change_column_value",
@@ -75,19 +80,38 @@ class MondayClient:
     def transport(self) -> str:
         return "oauth" if self._oauth else "direct"
 
-    async def _gql(self, query: str, variables: dict[str, Any] | None = None) -> dict[str, Any]:
+    async def _gql(
+        self,
+        query: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        api_version: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         if self._oauth is not None:
+            # The MCP passthrough pins its own API version; dev-only fields
+            # (external agents) surface as "Cannot query field" errors there.
             return await self._gql_mcp(query, variables)
-        return await self._gql_direct(query, variables)
+        return await self._gql_direct(query, variables, api_version=api_version, timeout=timeout)
 
-    async def _gql_direct(self, query: str, variables: dict[str, Any] | None) -> dict[str, Any]:
+    async def _gql_direct(
+        self,
+        query: str,
+        variables: dict[str, Any] | None,
+        *,
+        api_version: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {"query": query}
         if variables:
             body["variables"] = variables
-        resp = await self._http.post(
-            self._api_url, json=body,
-            headers={"Authorization": self._token, "Content-Type": "application/json"},
-        )
+        headers = {"Authorization": self._token, "Content-Type": "application/json"}
+        if api_version:
+            headers["API-Version"] = api_version
+        kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        resp = await self._http.post(self._api_url, json=body, headers=headers, **kwargs)
         resp.raise_for_status()
         data = resp.json()
         if "errors" in data and data["errors"]:
@@ -358,9 +382,15 @@ class MondayClient:
 
     # ── updates (comments) ─────────────────────────────────────
 
-    async def create_update(self, item_id: int, body: str) -> dict[str, Any]:
-        q = "mutation($item:ID!, $body:String!){create_update(item_id:$item, body:$body){id body created_at}}"
-        data = await self._gql(q, {"item": item_id, "body": body})
+    async def create_update(
+        self, item_id: int, body: str, *, parent_id: int | str | None = None,
+    ) -> dict[str, Any]:
+        if parent_id:
+            q = "mutation($item:ID!, $body:String!, $parent:ID){create_update(item_id:$item, body:$body, parent_id:$parent){id body created_at}}"
+            data = await self._gql(q, {"item": item_id, "body": body, "parent": str(parent_id)})
+        else:
+            q = "mutation($item:ID!, $body:String!){create_update(item_id:$item, body:$body){id body created_at}}"
+            data = await self._gql(q, {"item": item_id, "body": body})
         return data.get("create_update", {})
 
     async def list_updates(self, item_id: int, *, limit: int = 25) -> list[dict[str, Any]]:
@@ -445,6 +475,68 @@ class MondayClient:
         q = "mutation($id:ID!){delete_webhook(id:$id){id board_id}}"
         data = await self._gql(q, {"id": webhook_id})
         return data.get("delete_webhook", {})
+
+    # ── external agent (pre-release API, needs API-Version: dev) ──
+
+    async def connect_external_agent(self, name: str, callback_url: str) -> dict[str, Any]:
+        """Create Luna as a custom agent in the account. monday takes ~25 s.
+        Returns agent_id + signing_secret + api_token — shown once only."""
+        q = (
+            "mutation($input:ConnectExternalAgentSyncInput!){"
+            "connect_external_agent_sync(input:$input){agent_id signing_secret api_token instructions}}"
+        )
+        data = await self._gql(
+            q, {"input": {"custom": {"name": name, "callback_url": callback_url}}},
+            api_version=AGENT_API_VERSION, timeout=AGENT_CONNECT_TIMEOUT_S,
+        )
+        return data.get("connect_external_agent_sync", {}) or {}
+
+    async def activate_agent(self, agent_id: int | str) -> dict[str, Any]:
+        q = "mutation($id:ID!){activate_agent(id:$id){success}}"
+        data = await self._gql(q, {"id": str(agent_id)}, api_version=AGENT_API_VERSION)
+        return data.get("activate_agent", {}) or {}
+
+    async def update_custom_agent(
+        self,
+        agent_id: int | str,
+        *,
+        name: str | None = None,
+        callback_url: str | None = None,
+    ) -> dict[str, Any]:
+        """Rename or re-point the agent. A callback_url change rotates the
+        signing secret (returned); name-only updates return signing_secret null."""
+        inp: dict[str, Any] = {"agent_id": str(agent_id)}
+        if name:
+            inp["name"] = name
+        if callback_url:
+            inp["callback_url"] = callback_url
+        q = "mutation($input:UpdateCustomAgentInput!){update_custom_agent(input:$input){success signing_secret}}"
+        data = await self._gql(q, {"input": inp}, api_version=AGENT_API_VERSION)
+        return data.get("update_custom_agent", {}) or {}
+
+    async def disconnect_external_agent(self, agent_id: int | str) -> dict[str, Any]:
+        q = "mutation($id:ID!){disconnect_external_agent(id:$id){success}}"
+        data = await self._gql(q, {"id": str(agent_id)}, api_version=AGENT_API_VERSION)
+        return data.get("disconnect_external_agent", {}) or {}
+
+    async def add_agent_resource_access(
+        self,
+        agent_id: int | str,
+        resource_id: int | str,
+        *,
+        scope_type: str = "BOARD",
+        permission_type: str = "READ_WRITE",
+    ) -> dict[str, Any]:
+        """Agents don't inherit the creator's access — grant boards/docs one by one."""
+        q = (
+            "mutation($id:ID!, $res:ID!, $scope:AgentResourceScopeType!, $perm:AgentResourcePermissionType!){"
+            "add_agent_resource_access(id:$id, resource_id:$res, scope_type:$scope, permission_type:$perm){success}}"
+        )
+        data = await self._gql(
+            q, {"id": str(agent_id), "res": str(resource_id), "scope": scope_type, "perm": permission_type},
+            api_version=AGENT_API_VERSION,
+        )
+        return data.get("add_agent_resource_access", {}) or {}
 
     # ── account info ───────────────────────────────────────────
 

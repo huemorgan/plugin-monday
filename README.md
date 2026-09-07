@@ -35,7 +35,7 @@ serves gateway key-provisioning via `LUNA_MONDAY_API_KEY` /
 
 ## What it does
 
-28 skill-gated tools across six skills:
+29 skill-gated tools across seven skills:
 
 | Skill | Tools |
 |---|---|
@@ -45,6 +45,7 @@ serves gateway key-provisioning via `LUNA_MONDAY_API_KEY` /
 | `monday-updates` | create/list updates, create/list subitems |
 | `monday-webhooks` | create/list/delete board webhooks (change triggers) |
 | `monday-api` | raw GraphQL query + mutation — the whole API |
+| `monday-agent` | grant the Luna agent inside monday access to a board/doc |
 
 ## Change triggers (webhooks)
 
@@ -55,6 +56,26 @@ plugin's receiver (`/api/p/plugin-monday/webhook/{secret}` — per-install
 secret, challenge echo handled). Events re-emit on Luna's event bus as
 `monday.*` (`monday.item.created`, `monday.column.changed`,
 `monday.status.changed`, ...) for playbooks and schedulers.
+
+## Luna inside monday.com (external agent)
+
+Settings → **Add to Monday.com** lists Luna as an agent in the connected
+account (monday's pre-release external-agent API, `API-Version: dev`;
+needs the personal-API-token connection — the OAuth/MCP passthrough can't
+select the dev version). monday users can then chat with it, @mention it in
+an update, or assign it an item.
+
+- Callback URL is minted through **plugin-webhooks** on the luna.com.ai
+  gateway, so it survives machine restarts and wakes a sleeping machine.
+- Chat replies stream back as SSE; mentions/assignments are acked, then the
+  reply is posted in the thread as the agent (falls back to the connected
+  user when the agent lacks board access).
+- Agents start with no board access: ask Luna to
+  "give your monday agent access to board X"
+  (`monday_agent_grant_board_access`).
+- Requests are verified with `x-monday-signature` (HMAC-SHA256 over
+  `{timestamp}.{body}`), a 10-minute freshness window, and a per-install
+  path secret.
 
 ## Settings UI
 
@@ -68,7 +89,8 @@ paste behind an expandable detail.
 plugin_monday/
   __init__.py        # the plugin (luna_sdk only) — tools + skills + settings tab
   client.py          # MondayClient (oauth/direct transports) + DCR helpers
-  routes.py          # OAuth connect/callback (PKCE+state), status, disconnect, webhook receiver
+  routes.py          # OAuth connect/callback (PKCE+state), status, disconnect, webhook receiver, agent connect/callback
+  agent.py           # external-agent helpers: signature, prompt, SSE, reply delivery
   state.py           # process-level MondayClient holder (OAuth hot-swap)
   interface/webui/settings/index.html   # the iframe settings page (OAuth popup)
   luna-plugin.toml   # the data manifest the marketplace reads

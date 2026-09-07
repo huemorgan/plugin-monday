@@ -9,9 +9,14 @@ the same from a managed dir.
 
 from __future__ import annotations
 
+from typing import Any
+
 from .client import MondayClient
 
 _client: MondayClient | None = None
+# The live MondayPlugin — routes reach it for the plugin-webhooks mint
+# (agent callback URL) without touching the core loader.
+_plugin: Any | None = None
 
 
 def get_client() -> MondayClient | None:
@@ -21,3 +26,12 @@ def get_client() -> MondayClient | None:
 def set_client(client: MondayClient | None) -> None:
     global _client
     _client = client
+
+
+def get_plugin() -> Any | None:
+    return _plugin
+
+
+def set_plugin(plugin: Any | None) -> None:
+    global _plugin
+    _plugin = plugin

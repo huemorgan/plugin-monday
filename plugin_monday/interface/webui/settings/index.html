@@ -66,6 +66,20 @@
     }
     input[type=password]:focus { outline: none; border-color: var(--violet); }
     #triggers { margin-top: 1rem; }
+    #agent { margin-top: 1rem; }
+    .row { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; margin-top: .2rem; }
+    .row input[type=text] {
+      flex: 1 1 12rem; min-width: 10rem; padding: .6rem .75rem; border-radius: 8px;
+      border: 1px solid var(--line); background: var(--panel-2);
+      color: var(--text); font-size: 14px; font-family: inherit;
+    }
+    .row input[type=text]:focus { outline: none; border-color: var(--violet); }
+    .note { font-size: 12.5px; color: var(--faint); margin: .8rem 0 0; line-height: 1.5; }
+    .note code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      color: var(--dim); word-break: break-all;
+    }
+    .warn { color: var(--amber, #f5a524); }
   </style>
 </head>
 <body>
@@ -101,6 +115,28 @@
     <p class="eyebrow">Triggers from Monday.com</p>
     <p class="headline"><span id="triggers-dot" class="dot off"></span> <span id="triggers-headline"></span></p>
     <p class="support" id="triggers-support" style="margin-bottom:0"></p>
+  </div>
+
+  <div id="agent" class="card hidden" data-testid="monday-agent-card">
+    <p class="eyebrow">Luna inside Monday.com</p>
+    <p class="headline"><span id="agent-dot" class="dot off"></span> <span id="agent-headline"></span></p>
+    <p class="support" id="agent-support"></p>
+    <div id="agent-create" class="row hidden">
+      <input id="agent-name" type="text" value="Luna" maxlength="60" placeholder="Agent name"
+             data-testid="monday-agent-name" />
+      <button id="agent-add-btn" class="primary" data-testid="monday-agent-add-btn">Add to Monday.com</button>
+    </div>
+    <div id="agent-remove" class="row hidden">
+      <button id="agent-remove-btn" class="danger" data-testid="monday-agent-remove-btn">Remove from Monday.com</button>
+    </div>
+    <p id="agent-warning" class="note warn hidden"></p>
+    <details id="agent-details" class="hidden">
+      <summary>How it works</summary>
+      <p>Chat with the agent from Monday.com, <b>@mention</b> it in an update, or <b>assign</b> it an item.
+         Chat replies stream back into Monday; mentions and assignments get an update on the item.</p>
+      <p>The agent starts with no board access. Ask Luna: <b>"give your monday agent access to board &lt;name&gt;"</b>.</p>
+      <p>Callback URL: <code id="agent-url"></code></p>
+    </details>
   </div>
 
   <script>
@@ -139,7 +175,56 @@
           show('disconnected');
         }
         renderTriggers(s.webhooks_ready === true);
+        renderAgent(s);
       } catch (e) { showError(e.message); show('disconnected'); }
+    }
+
+    function renderAgent(s) {
+      const card = el('agent');
+      if (!s.connected) { card.classList.add('hidden'); return; }
+      card.classList.remove('hidden');
+      const a = s.agent;
+      const ready = s.webhooks_ready === true;
+      el('agent-create').classList.toggle('hidden', !!a || !ready);
+      el('agent-remove').classList.toggle('hidden', !a);
+      el('agent-details').classList.toggle('hidden', !a);
+      el('agent-warning').classList.add('hidden');
+      if (a) {
+        el('agent-dot').className = 'dot ' + (a.active ? 'on' : 'off');
+        el('agent-headline').textContent = 'Listed as ' + (a.name || 'Luna') + (a.active ? '' : ' (not active)');
+        el('agent-support').textContent = a.active
+          ? 'Monday.com users can chat with it, @mention it, or assign it items.'
+          : 'Created in Monday.com but activation failed — remove and add again.';
+        el('agent-url').textContent = a.callback_url || '';
+      } else if (!ready) {
+        el('agent-dot').className = 'dot off';
+        el('agent-headline').textContent = 'Needs the Webhooks plugin';
+        el('agent-support').textContent =
+          'Install the Webhooks plugin from the Marketplace first — it gives Monday.com a stable URL for the agent.';
+      } else {
+        el('agent-dot').className = 'dot off';
+        el('agent-headline').textContent = 'Not listed yet';
+        el('agent-support').textContent =
+          'One click creates this agent inside your Monday.com account. Takes about half a minute.';
+      }
+    }
+    async function agentAdd() {
+      const btn = el('agent-add-btn'); btn.dataset.label = 'Add to Monday.com';
+      const name = (el('agent-name').value || '').trim() || 'Luna';
+      busy(btn, true, 'Creating in Monday.com…'); showError(null);
+      try {
+        const r = await fetchJSON(BASE + '/agent/connect', { method: 'POST', body: JSON.stringify({ name }) });
+        await refresh();
+        if (r.warning) { const w = el('agent-warning'); w.textContent = r.warning; w.classList.remove('hidden'); }
+      } catch (e) { showError(e.message); }
+      finally { busy(btn, false, ''); }
+    }
+    async function agentRemove() {
+      const btn = el('agent-remove-btn'); btn.dataset.label = 'Remove from Monday.com';
+      busy(btn, true, 'Removing…'); showError(null);
+      try { await fetchJSON(BASE + '/agent/disconnect', { method: 'POST' }); await refresh(); }
+      catch (e) { showError(e.message); }
+      finally { busy(btn, false, ''); }
     }
 
     function renderTriggers(ready) {
@@ -199,6 +284,9 @@
     el('token-btn').addEventListener('click', connectToken);
     el('token-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') connectToken(); });
     el('disconnect-btn').addEventListener('click', disconnect);
+    el('agent-add-btn').addEventListener('click', agentAdd);
+    el('agent-name').addEventListener('keydown', (e) => { if (e.key === 'Enter') agentAdd(); });
+    el('agent-remove-btn').addEventListener('click', agentRemove);
     refresh();
   </script>
 </body>
